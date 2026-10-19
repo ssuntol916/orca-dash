@@ -268,6 +268,8 @@ class OrcaDash(App):
                 cur = table.coordinate_to_cell_key((table.cursor_row, 0)).row_key.value
             except Exception:
                 cur = None
+        # DataTable.clear() 가 스크롤 위치를 0으로 되돌리므로 미리 저장해 둔다.
+        scroll_x = table.scroll_x
         table.clear()
         for r in self._visible():
             label, style, _ = STATE_STYLE.get(r.state, (r.state or "?", "white", 9))
@@ -284,7 +286,23 @@ class OrcaDash(App):
                 table.move_cursor(row=table.get_row_index(cur))
             except Exception:
                 pass
+        self._restore_scroll_x(table, scroll_x)
         self._tick_status()
+
+    def _restore_scroll_x(self, table: DataTable, x: float) -> None:
+        """새로고침 전 좌우 스크롤 위치를 복원한다. (세로는 커서 복원이 처리)
+
+        clear() 직후에는 표 크기가 아직 재계산되지 않아 값이 잘릴 수 있으므로
+        즉시 한 번, 화면 갱신 뒤 한 번 더 적용한다.
+        """
+        if not x:
+            return
+
+        def apply() -> None:
+            table.scroll_to(x=x, animate=False, force=True)
+
+        apply()
+        self.call_after_refresh(apply)
 
     def _tick_status(self) -> None:
         vis = self._visible()
