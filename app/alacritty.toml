@@ -1,0 +1,15 @@
+# Orca Dash.app 전용 Alacritty 설정. ~/.config/alacritty 의 개인 설정과는 무관하다.
+
+[window]
+title = "Orca Dash"
+dynamic_title = false
+dimensions = { columns = 170, lines = 48 }
+padding = { x = 8, y = 6 }
+decorations = "Full"
+option_as_alt = "Both"
+
+[font]
+size = 13.0
+
+[env]
+TERM = "xterm-256color"
