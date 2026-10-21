@@ -9,7 +9,14 @@ Orca 1.4.230 출력 구조 기준으로 작성.
              (모달에서 Enter 전송 · Ctrl+J 또는 Shift+Enter 줄바꿈 · Esc 취소)
   Ctrl+G     프롬프트 창에서 AI(로컬 claude -p 또는 codex exec)가 초안 작성.
              메모를 적고 누르면 초안 생성, 다시 누르면 현재 내용을 다듬기. --ai 옵션 참고
+  o          옵션 보기/수정 (조회 간격·소스·AI). 저장하면 설정 파일에 쓰고 바로 적용
   r 새로고침 · f 필터 · e 빈 워크트리 · q 종료
+  macOS 에서는 메인 화면이 앞에 있을 때 입력 소스를 영문(ABC)으로 자동 전환하고, 프롬프트·옵션 창을
+  열거나 다른 앱으로 가거나 종료하면 원래 입력 소스로 되돌린다 (옵션에서 끌 수 있음). 메인 화면에서 Caps Lock·
+  ⌃Space 로 한글로 바꿔도 1초 안에 다시 영문이 된다. 그래서 한글 상태에서도 단축키가 바로 듣는다. 자동 전환이 꺼져 있거나 안 되는 환경에서는 같은 자리의 두벌식 자모(ㅔ=p · ㅐ=o ·
+  ㄱ=r · ㄹ=f · ㄷ=e · ㅂ=q)로도 동작하되, IME 가 자모를 조합 중 상태로 붙잡으면 Space/Enter 로 확정해야 한다.
+
+설정 파일: ~/.config/orca-dash/config.json (--config 로 변경). 명령줄 인자가 있으면 그 값이 우선.
 
 사용:
   python3 orca_dash.py                         # 로컬, 60초 간격
@@ -28,9 +35,12 @@ import os
 import shlex
 import shutil
 import signal
+import subprocess
+import sys
 import tempfile
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from rich.text import Text
@@ -40,7 +50,8 @@ from textual import events
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.screen import ModalScreen
-from textual.widgets import Button, DataTable, Footer, Header, Label, Static, TextArea
+from textual.widgets import (Button, Checkbox, DataTable, Footer, Header, Input, Label, Select,
+                             Static, TextArea)
 from textual.worker import Worker, WorkerState
 
 # 상태 표시: (라벨, 색, 정렬 우선순위 — 작을수록 위)
@@ -54,6 +65,17 @@ STATE_STYLE = {
     None: ("에이전트 없음", "dim", 5),
 }
 FILTERS = ["전체", "주의 필요", "진행 중"]
+
+# 두벌식 자판에서 영문 키와 같은 자리의 자모. 한글 입력 상태에서는 터미널이 키코드가 아니라
+# 조합된 글자를 넘기므로, 단축키마다 같은 자리의 자모를 함께 묶어 어느 입력 상태에서도 동작하게 한다.
+HANGUL_2SET = dict(zip("qwertyuiopasdfghjklzxcvbnm",
+                       "ㅂㅈㄷㄱㅅㅛㅕㅑㅐㅔㅁㄴㅇㄹㅎㅗㅓㅏㅣㅋㅌㅊㅍㅠㅜㅡ"))
+
+
+def key_binding(letter: str, action: str, description: str, **kwargs) -> Binding:
+    """영문 글자 + 같은 자리의 한글 자모를 한 바인딩으로. Footer 에는 영문만 표시."""
+    keys = letter + ("," + HANGUL_2SET[letter] if letter in HANGUL_2SET else "")
+    return Binding(keys, action, description, key_display=letter, **kwargs)
 
 
 @dataclass
@@ -296,7 +318,7 @@ class AIConfig:
         if provider == "auto":
             provider = "claude" if shutil.which("claude") else "codex" if shutil.which("codex") else "off"
         elif provider != "off" and not shutil.which(provider):
-            raise SystemExit(f"--ai {provider}: 실행 파일을 PATH 에서 찾을 수 없습니다")
+            raise ConfigError(f"AI 공급자 {provider}: 실행 파일을 PATH 에서 찾을 수 없습니다")
         if model is None and provider == "claude":
             model = "haiku"  # 5초 안팎, 회당 약 $0.003
         if timeout is None:
@@ -592,6 +614,407 @@ class PromptScreen(ModalScreen[str | None]):
             self.dismiss(None)
 
 
+# ---------------------------------------------------------------------------
+# 설정: ~/.config/orca-dash/config.json 에 저장하고, 대시보드에서 o 키로 보고 고친다.
+# 명령줄 인자로 준 값은 파일 값보다 우선한다.
+# ---------------------------------------------------------------------------
+DEFAULT_CONFIG = os.path.join(os.path.expanduser("~"), ".config", "orca-dash", "config.json")
+AI_CHOICES = ["auto", "claude", "codex", "off"]
+
+
+class ConfigError(Exception):
+    pass
+
+
+def _split_list(text: str) -> list[str]:
+    """쉼표·공백으로 나열한 값을 리스트로."""
+    return [t for t in text.replace(",", " ").split() if t]
+
+
+@dataclass
+class Settings:
+    interval: int = 60                              # 조회 간격(초), 최소 5
+    orca: str = "orca"                              # orca 실행 파일
+    local: bool = True                              # 로컬 Orca 조회
+    env: list[str] = field(default_factory=list)    # 페어링된 Remote Orca Server 이름들
+    host: list[str] = field(default_factory=list)   # orca --host 선택자들
+    ssh: list[str] = field(default_factory=list)    # ssh 대상들 (원격에서 orca 직접 실행)
+    ai: str = "auto"                                # auto | claude | codex | off
+    ai_model: str = ""                              # 빈 값이면 공급자 기본
+    ai_timeout: float | None = None                 # None 이면 공급자 기본
+    ai_context: bool = True                         # 에이전트 상황을 초안 모델에 전달
+    auto_abc: bool = True                           # macOS: 메인 화면에서 입력 소스를 영문으로 자동 전환
+
+    FIELDS = ("interval", "orca", "local", "env", "host", "ssh",
+              "ai", "ai_model", "ai_timeout", "ai_context", "auto_abc")
+
+    @classmethod
+    def load(cls, path: str) -> "Settings":
+        """파일이 없으면 기본값. 모르는 키는 무시한다."""
+        s = cls()
+        if not os.path.exists(path):
+            return s
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError) as e:
+            raise ConfigError(f"설정 파일을 읽을 수 없습니다 ({path}): {e}") from e
+        if not isinstance(data, dict):
+            raise ConfigError(f"설정 파일 형식이 잘못되었습니다 ({path}): 최상위가 객체가 아님")
+        for k in cls.FIELDS:
+            if k in data:
+                setattr(s, k, data[k])
+        errors = s.validate()
+        if errors:
+            raise ConfigError(f"설정 파일 값이 잘못되었습니다 ({path}): " + "; ".join(errors))
+        return s
+
+    def save(self, path: str) -> None:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({k: getattr(self, k) for k in self.FIELDS}, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(tmp, path)
+
+    def validate(self) -> list[str]:
+        """값의 타입을 맞추고 문제 목록을 돌려준다. 비어 있으면 정상."""
+        errs: list[str] = []
+        try:
+            self.interval = max(5, int(self.interval))
+        except (TypeError, ValueError):
+            errs.append("조회 간격은 정수(초)")
+        self.orca = str(self.orca or "").strip() or "orca"
+        self.local = bool(self.local)
+        for k in ("env", "host", "ssh"):
+            v = getattr(self, k)
+            if isinstance(v, str):
+                v = _split_list(v)
+            setattr(self, k, [str(x).strip() for x in (v or []) if str(x).strip()])
+        if self.ai not in AI_CHOICES:
+            errs.append(f"AI 공급자는 {'/'.join(AI_CHOICES)} 중 하나")
+        self.ai_model = str(self.ai_model or "").strip()
+        if self.ai_timeout in (None, ""):
+            self.ai_timeout = None
+        else:
+            try:
+                self.ai_timeout = float(self.ai_timeout)
+                if self.ai_timeout <= 0:
+                    errs.append("AI 제한 시간은 0보다 큰 수(초)")
+            except (TypeError, ValueError):
+                errs.append("AI 제한 시간은 수(초) 또는 빈 값")
+        self.ai_context = bool(self.ai_context)
+        self.auto_abc = bool(self.auto_abc)
+        if not self.local and not (self.env or self.host or self.ssh):
+            errs.append("조회할 소스가 없음 (로컬을 끄면 env/host/ssh 중 하나 필요)")
+        return errs
+
+    def apply_args(self, args: argparse.Namespace) -> list[str]:
+        """명령줄에서 준 값으로 덮어쓰고, 덮어쓴 항목 이름을 돌려준다."""
+        over: list[str] = []
+        for k, v in [("interval", args.interval), ("orca", args.orca), ("env", args.env),
+                     ("host", args.host), ("ssh", args.ssh), ("ai", args.ai),
+                     ("ai_model", args.ai_model), ("ai_timeout", args.ai_timeout)]:
+            if v is not None:
+                setattr(self, k, v)
+                over.append(k)
+        if args.no_local:
+            self.local = False
+            over.append("local")
+        if args.ai_context is not None:
+            self.ai_context = args.ai_context == "on"
+            over.append("ai_context")
+        return over
+
+    def sources(self) -> list[Source]:
+        out: list[Source] = []
+        if self.local:
+            out.append(Source(label="local", orca=self.orca))
+        out += [Source(label=e, orca=self.orca, env=e) for e in self.env]
+        out += [Source(label=h, orca=self.orca, host=h) for h in self.host]
+        out += [Source(label=t, ssh=t) for t in self.ssh]
+        return out
+
+    def ai_config(self) -> AIConfig:
+        return AIConfig.from_args(self.ai, self.ai_model or None, self.ai_timeout, self.ai_context)
+
+
+class InputSource:
+    """macOS 키보드 입력 소스(한글/영문) 조회·전환. Carbon TIS API 를 ctypes 로 호출한다.
+
+    터미널 앱은 키코드를 받지 못하고 IME 가 조합한 글자만 받으므로, 한글 상태에서 q 같은 단축키는
+    자모 조합 중 상태에 머물러 동작하지 않는다. 메인 화면이 앞에 있을 때만 영문으로 바꿔 두면 해결된다.
+    macOS 가 아니거나 API 를 못 쓰면 available=False 로 조용히 비활성화된다.
+
+    영문(키보드 레이아웃)으로의 전환은 TIS 호출만으로 되지만, 한글 같은 입력기(IM)로 되돌리는 것은
+    메뉴바 아이콘만 바뀌고 적용되지 않는 macOS 버그가 있다. 그래서 보조 실행 파일(orca-dash-im,
+    app/imselect.swift · macism 과 같은 인터페이스)이 있으면 그것으로 전환한다. 보조 도구는 전환 직후
+    아주 작은 창을 잠깐 띄워 포커스를 가져갔다 돌려주는 방식으로 적용을 강제한다.
+    """
+    ENGLISH_LANG = "en"
+    HELPER_NAMES = ("orca-dash-im", "macism")
+
+    def __init__(self) -> None:
+        self.available = False
+        self.english: int | None = None
+        self.helper: str | None = None
+        if sys.platform != "darwin":
+            return
+        self.helper = self._find_helper()
+        try:
+            import ctypes
+            import ctypes.util
+            self._ct = ctypes
+            cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
+            tis = ctypes.CDLL(ctypes.util.find_library("Carbon"))
+            cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+            cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+            cf.CFStringGetCString.restype = ctypes.c_bool
+            cf.CFStringGetCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
+            cf.CFRelease.argtypes = [ctypes.c_void_p]
+            cf.CFRunLoopRunInMode.restype = ctypes.c_int32
+            cf.CFRunLoopRunInMode.argtypes = [ctypes.c_void_p, ctypes.c_double, ctypes.c_bool]
+            self._runloop_mode = ctypes.c_void_p.in_dll(cf, "kCFRunLoopDefaultMode")
+            tis.TISCopyCurrentKeyboardInputSource.restype = ctypes.c_void_p
+            tis.TISCopyInputSourceForLanguage.restype = ctypes.c_void_p
+            tis.TISCopyInputSourceForLanguage.argtypes = [ctypes.c_void_p]
+            tis.TISGetInputSourceProperty.restype = ctypes.c_void_p
+            tis.TISGetInputSourceProperty.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            tis.TISSelectInputSource.restype = ctypes.c_int32
+            tis.TISSelectInputSource.argtypes = [ctypes.c_void_p]
+            self._cf, self._tis = cf, tis
+            self._utf8 = 0x08000100
+            self._k_id = ctypes.c_void_p.in_dll(tis, "kTISPropertyInputSourceID")
+            lang = cf.CFStringCreateWithCString(None, self.ENGLISH_LANG.encode(), self._utf8)
+            self.english = tis.TISCopyInputSourceForLanguage(lang)  # 보통 com.apple.keylayout.ABC
+            cf.CFRelease(lang)
+            self.english_id = self._id_of(self.english) if self.english else None
+            self.available = bool(self.english_id)
+        except Exception:
+            self.available = False
+
+    @classmethod
+    def _find_helper(cls) -> str | None:
+        """ORCA_DASH_IM 환경 변수 → 저장소 bin/ → PATH 순으로 보조 도구를 찾는다."""
+        cand = [os.environ.get("ORCA_DASH_IM", ""),
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin", "orca-dash-im")]
+        for c in cand:
+            if c and os.path.isfile(c) and os.access(c, os.X_OK):
+                return c
+        for name in cls.HELPER_NAMES:
+            found = shutil.which(name)
+            if found:
+                return found
+        return None
+
+    def _id_of(self, ref: int) -> str | None:
+        prop = self._tis.TISGetInputSourceProperty(ref, self._k_id)
+        if not prop:
+            return None
+        buf = self._ct.create_string_buffer(256)
+        return buf.value.decode() if self._cf.CFStringGetCString(prop, buf, 256, self._utf8) else None
+
+    def current(self, *, fresh: bool = True) -> str | None:
+        """현재 입력 소스 ID (예: com.apple.inputmethod.Korean.2SetKorean).
+
+        TIS 의 '현재값'은 프로세스별 캐시라 다른 프로세스가 바꾼 것을 늦게 보거나 못 볼 수 있다.
+        fresh 이면 보조 도구를 새 프로세스로 띄워 정확한 값을 읽는다(약 70ms). 1초마다 도는 감시처럼
+        자주 부르는 곳은 fresh=False 로 프로세스 안에서 읽는다(런루프를 잠깐 돌리면 외부 변경도 들어옴, 약 10ms).
+        """
+        if not self.available:
+            return None
+        if fresh and self.helper:
+            try:
+                out = subprocess.run([self.helper], capture_output=True, text=True, timeout=2).stdout.strip()
+                if out:
+                    return out
+            except (OSError, subprocess.SubprocessError):
+                pass
+        self._settle(0.01)
+        try:
+            ref = self._tis.TISCopyCurrentKeyboardInputSource()
+            if not ref:
+                return None
+            try:
+                return self._id_of(ref)
+            finally:
+                self._cf.CFRelease(ref)
+        except Exception:
+            return None
+
+    def _settle(self, seconds: float = 0.05) -> None:
+        """런루프를 잠깐 돌린다. 한글 같은 입력기(IM)로의 전환은 런루프가 돌아야 시스템에 반영되고,
+        다른 프로세스가 바꾼 현재값 알림도 이때 들어온다."""
+        try:
+            self._cf.CFRunLoopRunInMode(self._runloop_mode, seconds, False)
+        except Exception:
+            pass
+
+    def select_english(self) -> bool:
+        if not self.available:
+            return False
+        ok = self._tis.TISSelectInputSource(self.english) == 0
+        self._settle()
+        return ok
+
+    def select(self, source_id: str) -> bool:
+        """ID 로 입력 소스를 고른다. 보조 도구가 있으면 그것으로(IM 전환이 실제 적용됨), 없으면 TIS 로."""
+        if not self.available or not source_id:
+            return False
+        if source_id == self.english_id:
+            return self.select_english()
+        if self.helper:
+            try:
+                # 대시보드가 SIGHUP 으로 죽는 중에도 끝까지 돌도록 별도 세션으로 띄운다.
+                subprocess.Popen([self.helper, source_id], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
+                return True
+            except OSError:
+                pass
+        return self._select_tis(source_id)
+
+    def _select_tis(self, source_id: str) -> bool:
+        try:
+            cf, tis, ct = self._cf, self._tis, self._ct
+            tis.TISCreateInputSourceList.restype = ct.c_void_p
+            tis.TISCreateInputSourceList.argtypes = [ct.c_void_p, ct.c_bool]
+            cf.CFArrayGetCount.restype = ct.c_long
+            cf.CFArrayGetCount.argtypes = [ct.c_void_p]
+            cf.CFArrayGetValueAtIndex.restype = ct.c_void_p
+            cf.CFArrayGetValueAtIndex.argtypes = [ct.c_void_p, ct.c_long]
+            lst = tis.TISCreateInputSourceList(None, False)
+            if not lst:
+                return False
+            try:
+                for i in range(cf.CFArrayGetCount(lst)):
+                    ref = cf.CFArrayGetValueAtIndex(lst, i)
+                    if self._id_of(ref) == source_id:
+                        ok = tis.TISSelectInputSource(ref) == 0
+                        self._settle()
+                        return ok
+            finally:
+                cf.CFRelease(lst)
+        except Exception:
+            pass
+        return False
+
+
+class SettingsScreen(ModalScreen[Settings | None]):
+    """옵션을 보고 고치는 모달. 저장하면 설정 파일에 쓰고 바로 적용된다."""
+
+    DEFAULT_CSS = """
+    SettingsScreen { align: center middle; }
+    SettingsScreen > Vertical {
+        width: 90%; max-width: 100; height: 100%; max-height: 50;
+        border: thick $primary; background: $surface; padding: 1 2;
+    }
+    SettingsScreen #path, SettingsScreen #override { color: $text-muted; height: auto; }
+    SettingsScreen #form { height: 1fr; }
+    SettingsScreen .section { color: $accent; text-style: bold; margin-top: 1; }
+    SettingsScreen .row { height: 3; }
+    SettingsScreen .row Label { width: 20; padding-top: 1; }
+    SettingsScreen .row Input, SettingsScreen .row Select, SettingsScreen .row Checkbox { width: 1fr; }
+    SettingsScreen #form-error { color: $error; height: auto; }
+    SettingsScreen #buttons { height: auto; margin-top: 1; align-horizontal: right; }
+    SettingsScreen Button { margin-left: 1; }
+    """
+    BINDINGS = [
+        Binding("escape", "cancel", "취소"),
+        Binding("ctrl+s", "save", "저장", show=False, priority=True),
+    ]
+
+    def __init__(self, settings: Settings, path: str, overrides: list[str] = (), file_mode: bool = False):
+        super().__init__()
+        self.settings = settings
+        self.path = path
+        self.overrides = list(overrides)
+        self.file_mode = file_mode
+
+    def compose(self) -> ComposeResult:
+        s = self.settings
+
+        def row(label: str, widget) -> ComposeResult:
+            with Horizontal(classes="row"):
+                yield Label(label)
+                yield widget
+
+        with Vertical():
+            yield Label("옵션  (Enter 저장·적용 · Esc 취소)", id="title")
+            yield Label(f"설정 파일: {self.path}", id="path")
+            note = ""
+            if self.overrides:
+                note = ("명령줄 인자로 지정된 항목: " + ", ".join(self.overrides)
+                        + " — 저장하면 지금은 적용되지만 다음 실행에서는 명령줄 값이 다시 우선합니다.")
+            if self.file_mode:
+                note += (" " if note else "") + "--file 모드라서 소스 설정은 저장만 되고 이번 실행에는 적용되지 않습니다."
+            yield Label(note, id="override")
+            with VerticalScroll(id="form"):
+                yield Label("조회", classes="section")
+                yield from row("조회 간격(초)", Input(str(s.interval), type="integer", id="interval"))
+                yield from row("orca 실행 파일", Input(s.orca, id="orca"))
+                yield from row("로컬 Orca", Checkbox("조회함", s.local, id="local"))
+                yield from row("원격 서버 (--env)", Input(" ".join(s.env), placeholder="페어링 서버 이름, 공백으로 구분", id="env"))
+                yield from row("호스트 (--host)", Input(" ".join(s.host), placeholder="예: ssh:<id>", id="host"))
+                yield from row("ssh 대상 (--ssh)", Input(" ".join(s.ssh), placeholder="예: user@macmini-1", id="ssh"))
+                yield Label("AI 초안 (프롬프트 창 Ctrl+G)", classes="section")
+                yield from row("공급자", Select([(c, c) for c in AI_CHOICES], value=s.ai, allow_blank=False, id="ai"))
+                yield from row("모델", Input(s.ai_model, placeholder="비우면 기본 (claude: haiku · codex: CLI 설정)", id="ai_model"))
+                yield from row("제한 시간(초)", Input("" if s.ai_timeout is None else f"{s.ai_timeout:g}", type="number",
+                                                 placeholder="비우면 기본 (claude 60 · codex 90)", id="ai_timeout"))
+                yield from row("에이전트 상황 전달", Checkbox("지시·마지막 응답을 초안 모델에 전달", s.ai_context, id="ai_context"))
+                yield Label("키보드", classes="section")
+                yield from row("영문 자동 전환", Checkbox(
+                    "메인 화면이 앞에 있을 때 입력 소스를 영문으로 바꿔 한글 상태에서도 단축키가 듣게 함 (macOS)",
+                    s.auto_abc, id="auto_abc"))
+            yield Label("", id="form-error")
+            with Horizontal(id="buttons"):
+                yield Button("취소 (Esc)", id="cancel")
+                yield Button("저장·적용 (Enter)", id="save", variant="primary")
+
+    def on_mount(self) -> None:
+        self.query_one("#interval", Input).focus()
+
+    def _collect(self) -> Settings:
+        q = self.query_one
+        return Settings(
+            interval=q("#interval", Input).value,
+            orca=q("#orca", Input).value,
+            local=q("#local", Checkbox).value,
+            env=q("#env", Input).value, host=q("#host", Input).value, ssh=q("#ssh", Input).value,
+            ai=str(q("#ai", Select).value),
+            ai_model=q("#ai_model", Input).value,
+            ai_timeout=q("#ai_timeout", Input).value,
+            ai_context=q("#ai_context", Checkbox).value,
+            auto_abc=q("#auto_abc", Checkbox).value,
+        )
+
+    def action_save(self) -> None:
+        new = self._collect()
+        errs = new.validate()
+        if not errs:
+            try:
+                new.ai_config()  # 공급자 실행 파일 존재 여부까지 확인
+            except ConfigError as e:
+                errs.append(str(e))
+        if errs:
+            self.query_one("#form-error", Label).update("\n".join(f"• {e}" for e in errs))
+            return
+        self.dismiss(new)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.action_save()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "save":
+            self.action_save()
+        else:
+            self.dismiss(None)
+
+
 class OrcaDash(App):
     TITLE = "Orca 에이전트 대시보드"
     CSS = """
@@ -601,20 +1024,31 @@ class OrcaDash(App):
     #detail-box { height: 12; border-top: solid $primary; }
     #detail { padding: 0 1; }
     """
-    BINDINGS = [
-        Binding("p", "send_prompt", "프롬프트 보내기"),
-        Binding("r", "refresh", "새로고침"),
-        Binding("f", "cycle_filter", "필터"),
-        Binding("e", "toggle_empty", "빈 워크트리"),
-        Binding("q", "quit", "종료"),
+    BINDINGS = [  # 한글 입력 상태에서는 같은 자리의 자모(ㅔ ㅐ ㄱ ㄹ ㄷ ㅂ)로도 동작
+        key_binding("p", "send_prompt", "프롬프트 보내기"),
+        key_binding("o", "settings", "옵션"),
+        key_binding("r", "refresh", "새로고침"),
+        key_binding("f", "cycle_filter", "필터"),
+        key_binding("e", "toggle_empty", "빈 워크트리"),
+        key_binding("q", "quit", "종료"),
     ]
 
-    def __init__(self, sources: list[Source], interval: int, ai: AIConfig | None = None):
+    def __init__(self, settings: Settings, ai: AIConfig | None = None, *,
+                 config_path: str = DEFAULT_CONFIG, files: list[Source] | None = None,
+                 cli_overrides: list[str] = ()):
         super().__init__()
-        self.sources = sources
+        self.settings = settings
+        self.config_path = config_path
+        self.files = files            # --file 모드: 소스는 파일로 고정
+        self.cli_overrides = list(cli_overrides)
         self.ai = ai or AIConfig(provider="off")
-        self.source_by_label = {s.label: s for s in sources}
-        self.interval = interval
+        self._set_sources(files or settings.sources())
+        self.interval = settings.interval
+        self._refresh_timer = None
+        self.input_source = InputSource()
+        self._saved_source: str | None = None  # 영문으로 바꾸기 전의 입력 소스
+        # 전환 전 소스를 파일에도 남긴다. 신호조차 못 받고 죽었을 때 다음 실행이 이어받아 되돌리기 위함.
+        self._source_state_file = os.path.join(os.path.dirname(config_path) or ".", "input-source")
         self.rows: list[Row] = []
         self.filter_idx = 0
         self.show_empty = False
@@ -637,9 +1071,141 @@ class OrcaDash(App):
                            ("에이전트", "agent"), ("도구", "tool"), ("갱신", "upd"),
                            ("요약", "summary")]:
             table.add_column(label, key=key)
+        self._adopt_stale_source()  # 첫 조회(_tick_status 의 감시 포함)보다 먼저 지난 기록을 이어받는다
+        self._sync_input_source()
         await self.action_refresh()
-        self.set_interval(self.interval, self.action_refresh)
+        self._refresh_timer = self.set_interval(self.interval, self.action_refresh)
         self.set_interval(1, self._tick_status)
+        self._install_signal_handlers()
+
+    # --- 입력 소스 자동 전환 (macOS) ------------------------------------------
+    def _sync_input_source(self, *, fresh: bool = True) -> None:
+        """메인 화면이 앞에 있고 포커스가 있으면 영문으로, 아니면 원래 입력 소스로."""
+        if not self.input_source.available:
+            return
+        want_english = (self.settings.auto_abc and self.app_focus
+                        and not isinstance(self.screen, ModalScreen))
+        if want_english:
+            cur = self.input_source.current(fresh=fresh)
+            if cur and cur != self.input_source.english_id:
+                if self.input_source.select_english():
+                    self._saved_source = cur
+                    self._write_source_state(cur)
+        else:
+            self.restore_input_source()
+
+    def _keep_input_source(self) -> None:
+        """1초마다: 메인 화면에 있는데 사용자가 Caps Lock·⌃Space 로 한글로 바꿨으면 다시 영문으로.
+
+        포커스 이벤트는 창을 오갈 때만 오므로, 창 안에서 직접 바꾼 경우는 이렇게 감시해야 잡힌다.
+        모달 안이거나 포커스가 없으면 아무것도 하지 않는다(그때는 한글이 맞음).
+        """
+        if (self.input_source.available and self.settings.auto_abc and self.app_focus
+                and not isinstance(self.screen, ModalScreen)):
+            self._sync_input_source(fresh=False)
+
+    def restore_input_source(self) -> None:
+        if self._saved_source:
+            self.input_source.select(self._saved_source)
+            self._saved_source = None
+        self._write_source_state(None)
+
+    def _write_source_state(self, source: str | None) -> None:
+        try:
+            if source:
+                os.makedirs(os.path.dirname(self._source_state_file), exist_ok=True)
+                with open(self._source_state_file, "w", encoding="utf-8") as f:
+                    f.write(source)
+            elif os.path.exists(self._source_state_file):
+                os.remove(self._source_state_file)
+        except OSError:
+            pass
+
+    def _adopt_stale_source(self) -> None:
+        """지난 실행이 되돌리지 못하고 죽었으면(파일이 남아 있음) 그 소스를 이어받아 종료 때 되돌린다."""
+        if not self.input_source.available:
+            return
+        try:
+            with open(self._source_state_file, encoding="utf-8") as f:
+                stale = f.read().strip()
+        except OSError:
+            return
+        if stale and stale != self.input_source.english_id \
+                and self.input_source.current() == self.input_source.english_id:
+            self._saved_source = stale
+        else:
+            self._write_source_state(None)  # 사용자가 이미 직접 바꿔 둔 상태 → 잊는다
+
+    def _install_signal_handlers(self) -> None:
+        """창 닫기 버튼·Cmd+Q(SIGHUP)나 kill(SIGTERM)로 끝나도 입력 소스를 되돌리고 종료한다."""
+        try:
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGHUP, signal.SIGTERM):
+                loop.add_signal_handler(sig, self._on_terminate_signal, sig)
+        except (NotImplementedError, RuntimeError, ValueError):
+            pass
+
+    def _on_terminate_signal(self, sig: int) -> None:
+        self.restore_input_source()
+        # 정상 종료를 시도하되, 신호로 끝나는 상황에서는 이벤트 루프가 막혀 끝나지 않을 수 있다.
+        # 루프와 무관한 스레드 타이머로 1초 뒤 강제 종료한다. (복원 보조 도구는 별도 세션이라 영향 없음)
+        threading.Timer(1.0, os._exit, args=(0,)).start()
+        self.exit(return_code=0)
+
+    def watch_app_focus(self, focus: bool) -> None:
+        """터미널 창이 포커스를 얻거나 잃을 때 (Textual 의 app_focus 반응값)."""
+        if self.is_mounted:
+            self._sync_input_source()
+
+    def _open_modal(self, screen: ModalScreen, callback) -> None:
+        """모달을 열기 전 입력 소스를 되돌리고, 닫히면 다시 맞춘다."""
+        def done(result) -> None:
+            callback(result)
+            self._sync_input_source()
+        self.push_screen(screen, done)
+        self._sync_input_source()
+
+    async def action_quit(self) -> None:
+        self.restore_input_source()
+        await super().action_quit()
+
+    def _set_sources(self, sources: list[Source]) -> None:
+        self.sources = sources
+        self.source_by_label = {s.label: s for s in sources}
+
+    # --- 옵션 ---------------------------------------------------------------
+    def action_settings(self) -> None:
+        self._open_modal(
+            SettingsScreen(self.settings, self.config_path, self.cli_overrides, file_mode=bool(self.files)),
+            self._apply_settings)
+
+    def _apply_settings(self, new: Settings | None) -> None:
+        if new is None:
+            return
+        try:
+            ai = new.ai_config()
+        except ConfigError as e:
+            self.notify(str(e), title="옵션 적용 실패", severity="error", timeout=10)
+            return
+        saved = True
+        try:
+            new.save(self.config_path)
+        except OSError as e:
+            saved = False
+            self.notify(f"설정 파일에 쓰지 못했습니다: {e}", title="저장 실패", severity="error", timeout=10)
+        self.settings = new
+        self.ai = ai
+        self.interval = new.interval
+        if self._refresh_timer is not None:
+            self._refresh_timer.stop()
+        self._refresh_timer = self.set_interval(self.interval, self.action_refresh)
+        if not self.files:
+            self._set_sources(new.sources())
+        self.call_later(self.action_refresh)
+        ai_txt = f"{ai.provider}" + (f"/{ai.model}" if ai.model else "")
+        self.notify(("저장·적용: " if saved else "이번 실행에만 적용: ")
+                    + f"간격 {new.interval}초 · 소스 {len(self.sources)}개 · AI {ai_txt}",
+                    title="옵션", timeout=6)
 
     async def action_refresh(self) -> None:
         results = await asyncio.gather(*(fetch(s) for s in self.sources))
@@ -714,6 +1280,7 @@ class OrcaDash(App):
         self.call_after_refresh(apply)
 
     def _tick_status(self) -> None:
+        self._keep_input_source()
         vis = self._visible()
         counts: dict[str, int] = {}
         for r in self.rows:
@@ -755,7 +1322,7 @@ class OrcaDash(App):
 
         cwd = row.path if (src.label == "local" and row.path and os.path.isdir(row.path)) \
             else tempfile.gettempdir()
-        self.push_screen(PromptScreen(row, self.ai, cwd), on_result)
+        self._open_modal(PromptScreen(row, self.ai, cwd), on_result)
 
     async def _send_prompt(self, src: Source, row: Row, text: str) -> None:
         target = f"{row.repo}/{row.worktree}"
@@ -778,41 +1345,44 @@ class OrcaDash(App):
             self.query_one("#detail", Static).update(row.detail)
 
 
-def build_sources(args: argparse.Namespace) -> list[Source]:
-    sources: list[Source] = []
-    if args.file:
-        return [Source(label=f if len(args.file) > 1 else "file", file=f) for f in args.file]
-    if not args.no_local:
-        sources.append(Source(label="local", orca=args.orca))
-    for env in args.env or []:
-        sources.append(Source(label=env, orca=args.orca, env=env))
-    for host in args.host or []:
-        sources.append(Source(label=host, orca=args.orca, host=host))
-    for target in args.ssh or []:
-        sources.append(Source(label=target, ssh=target))
-    return sources
-
-
 def main() -> None:
-    p = argparse.ArgumentParser(description="Orca 에이전트 상태 TUI 대시보드")
-    p.add_argument("--interval", type=int, default=60, help="조회 간격(초), 기본 60")
-    p.add_argument("--orca", default="orca", help="orca 실행 파일 경로")
+    p = argparse.ArgumentParser(
+        description="Orca 에이전트 상태 TUI 대시보드",
+        epilog=f"옵션은 설정 파일({DEFAULT_CONFIG})에 저장되며 대시보드에서 o 키로 보고 고칠 수 있다. "
+               "명령줄 인자는 파일 값보다 우선한다.")
+    p.add_argument("--config", default=DEFAULT_CONFIG, help="설정 파일 경로")
+    p.add_argument("--interval", type=int, help="조회 간격(초), 기본 60")
+    p.add_argument("--orca", help="orca 실행 파일 경로, 기본 orca")
     p.add_argument("--env", action="append", help="페어링된 Remote Orca Server 이름 (반복 가능)")
     p.add_argument("--host", action="append", help="orca --host 선택자, 예: ssh:<id> (반복 가능)")
     p.add_argument("--ssh", action="append", help="ssh 접속 대상, 원격에서 orca 직접 실행 (반복 가능)")
     p.add_argument("--no-local", action="store_true", help="로컬 Orca 조회 안 함")
     p.add_argument("--file", action="append", help="저장된 JSON 파일로 표시 (테스트용)")
     g = p.add_argument_group("AI 초안 (프롬프트 창에서 Ctrl+G)")
-    g.add_argument("--ai", choices=["auto", "claude", "codex", "off"], default="auto",
+    g.add_argument("--ai", choices=AI_CHOICES,
                    help="초안 작성에 쓸 로컬 CLI. auto: claude → codex → off 순 자동 감지 (기본)")
     g.add_argument("--ai-model", help="모델 지정. claude 기본 haiku, codex 기본은 CLI 설정값")
     g.add_argument("--ai-timeout", type=float, help="초안 생성 제한 시간(초). 기본 claude 60, codex 90")
-    g.add_argument("--ai-context", choices=["on", "off"], default="on",
+    g.add_argument("--ai-context", choices=["on", "off"],
                    help="에이전트의 지시·마지막 응답을 초안 모델에 전달할지 (기본 on)")
     args = p.parse_args()
-    ai = AIConfig.from_args(args.ai, args.ai_model, args.ai_timeout, args.ai_context == "on")
-    OrcaDash(build_sources(args), max(5, args.interval), ai).run()
-
+    try:
+        settings = Settings.load(args.config)
+        overrides = settings.apply_args(args)
+        errs = settings.validate()
+        if errs:
+            raise ConfigError("옵션 오류: " + "; ".join(errs))
+        ai = settings.ai_config()
+    except ConfigError as e:
+        raise SystemExit(str(e))
+    files = None
+    if args.file:
+        files = [Source(label=f if len(args.file) > 1 else "file", file=f) for f in args.file]
+    app = OrcaDash(settings, ai, config_path=args.config, files=files, cli_overrides=overrides)
+    try:
+        app.run()
+    finally:
+        app.restore_input_source()
 
 if __name__ == "__main__":
     main()
