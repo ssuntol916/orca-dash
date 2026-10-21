@@ -12,7 +12,8 @@ Orca 1.4.230 출력 구조 기준으로 작성.
              프롬프트 창의 '작성 에이전트'에서 관점을 체크한다: 목표 지향(goal, 프로젝트 목표 문서 기준) ·
              문제 발견(review, git 변경분에서 문제를 찾음). 여러 개를 체크하면 각자 독립적으로 초안을 쓰고
              체크한 순서로 '[이름]' 머리말을 붙여 묶는다. ~/.config/orca-dash/agents/<id>.md 로 추가 가능
-  o          옵션 보기/수정 (조회 간격·소스·AI). 저장하면 설정 파일에 쓰고 바로 적용
+  o          옵션 보기/수정 (조회 간격·소스·AI). 저장하면 설정 파일에 쓰고 바로 적용.
+             「에이전트」 탭에서 작성 에이전트별 '생각의 흐름'(답을 쓰기 전에 거치는 생각 단계)을 +/- 로 편집
   r 새로고침 · f 필터 · e 빈 워크트리 · q 종료
   macOS 에서는 메인 화면이 앞에 있을 때 입력 소스를 영문(ABC)으로 자동 전환하고, 프롬프트·옵션 창을
   열거나 다른 앱으로 가거나 종료하면 원래 입력 소스로 되돌린다 (옵션에서 끌 수 있음). 메인 화면에서 Caps Lock·
@@ -44,6 +45,7 @@ import sys
 import tempfile
 import threading
 import time
+import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -55,7 +57,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import (Button, Checkbox, DataTable, Footer, Header, Input, Label, Select, SelectionList,
-                             Static, TextArea)
+                             Static, TabbedContent, TabPane, TextArea)
 from textual.worker import Worker, WorkerState
 
 # 상태 표시: (라벨, 색, 정렬 우선순위 — 작을수록 위)
@@ -373,6 +375,7 @@ class DraftAgent:
     context: tuple[str, ...]
     builtin: bool = True
     path: str = ""  # 사용자 정의 파일 경로
+    steps: tuple[str, ...] = ()  # 생각의 흐름: 답을 쓰기 전에 순서대로 거치는 생각 단계 (옵션 > 에이전트 탭에서 편집)
 
     @property
     def label(self) -> str:
@@ -384,6 +387,10 @@ BUILTIN_AGENTS: list[DraftAgent] = [
         id="goal", name="목표 지향",
         description="프로젝트 목표 문서에 비추어 다음 지시를 쓴다",
         context=("instruction", "last_message", "goal"),
+        steps=("프로젝트 목표(없으면 원래 지시)에서 이번 작업과 관련된 항목을 찾는다",
+               "마지막 응답이 그 항목에 얼마나 다가갔는지, 벗어난 부분은 없는지 판단한다",
+               "목표에 가장 가까워지는 다음 한 단계를 정한다",
+               "그 단계를 바로 실행할 수 있는 지시로 쓴다"),
         instructions="""\
 역할: 프로젝트의 목표를 향해 작업을 이끄는 리드.
 - '프로젝트 목표'가 있으면 이번 작업이 그중 어느 항목에 기여하는지 한 문장으로 짚고, 목표에서 벗어난 작업은 되돌리거나 범위를 좁히도록 지시한다.
@@ -395,6 +402,10 @@ BUILTIN_AGENTS: list[DraftAgent] = [
         id="review", name="문제 발견",
         description="변경분에서 버그·누락·테스트 공백을 찾아 수정 지시를 쓴다",
         context=("instruction", "last_message", "diff", "log"),
+        steps=("변경분에서 바뀐 파일과 함수를 파악한다",
+               "각 변경의 입력·경계 조건·실패 경로를 따라가며 문제를 찾는다",
+               "테스트가 그 변경을 덮는지 확인한다",
+               "찾은 문제를 파일·함수와 함께 정리하고 수정 지시로 마무리한다"),
         instructions="""\
 역할: 변경된 코드에서 문제를 찾는 리뷰어.
 - '변경분'을 읽고 버그, 빠진 예외 처리, 경계 조건, 동시성·자원 누수, 테스트 공백, 원래 지시와 어긋난 구현을 찾는다.
@@ -416,6 +427,7 @@ def parse_agent_file(path: str) -> DraftAgent:
         name: 테스트 작성                 (필수)
         description: 변경분에 맞는 테스트  (선택)
         context: diff, log               (선택, 기본 instruction, last_message)
+        step: 바뀐 함수를 파악한다          (선택, 반복 가능 — 생각의 흐름 기본값. 옵션 > 에이전트 탭에서 덮어씀)
         ---
         역할 지시문 본문…
 
@@ -427,6 +439,7 @@ def parse_agent_file(path: str) -> DraftAgent:
     with open(path, encoding="utf-8") as f:
         text = f.read()
     meta: dict[str, str] = {}
+    steps: list[str] = []
     body = text
     lines = text.splitlines()
     if lines and lines[0].strip() == "---":
@@ -440,7 +453,10 @@ def parse_agent_file(path: str) -> DraftAgent:
             if ":" not in line:
                 raise ConfigError(f"{path}: frontmatter 줄 형식 오류 — {line.strip()}")
             k, v = line.split(":", 1)
-            meta[k.strip().lower()] = v.strip()
+            if k.strip().lower() in ("step", "steps"):
+                steps.append(v.strip())
+            else:
+                meta[k.strip().lower()] = v.strip()
         body = "\n".join(lines[close + 1:])
     name = meta.get("name", "").strip()
     if not name:
@@ -452,11 +468,14 @@ def parse_agent_file(path: str) -> DraftAgent:
     if not body.strip():
         raise ConfigError(f"{path}: 지시문 본문이 비어 있음")
     return DraftAgent(id=agent_id, name=name, description=meta.get("description", "").strip(),
-                      instructions=body.strip() + "\n", context=ctx, builtin=False, path=path)
+                      instructions=body.strip() + "\n", context=ctx, builtin=False, path=path,
+                      steps=tuple(x for x in steps if x))
 
 
-def load_agents(config_path: str) -> tuple[list[DraftAgent], list[str]]:
+def load_agents(config_path: str,
+                step_overrides: dict[str, list[str]] | None = None) -> tuple[list[DraftAgent], list[str]]:
     """내장 에이전트에 사용자 정의(agents/*.md)를 합친다. 같은 id 면 사용자 정의가 내장을 덮는다.
+    step_overrides(설정의 agent_steps)에 있는 id 는 생각의 흐름을 그 값으로 바꾼다.
     잘못된 파일은 건너뛰고 오류 메시지 목록으로 돌려준다."""
     agents = {a.id: a for a in BUILTIN_AGENTS}
     errors: list[str] = []
@@ -472,6 +491,9 @@ def load_agents(config_path: str) -> tuple[list[DraftAgent], list[str]]:
             errors.append(str(e))
             continue
         agents[a.id] = a
+    for aid, steps in (step_overrides or {}).items():
+        if aid in agents:
+            agents[aid] = dataclasses.replace(agents[aid], steps=tuple(steps))
     return list(agents.values()), errors
 
 
@@ -628,7 +650,11 @@ async def _run_cli(cmd: list[str], stdin: str, cwd: str | None, timeout: float) 
 
 
 def draft_system_prompt(agent: DraftAgent) -> str:
-    return DRAFT_SYSTEM + "\n[역할]\n" + agent.instructions.strip() + "\n"
+    out = DRAFT_SYSTEM + "\n[역할]\n" + agent.instructions.strip() + "\n"
+    if agent.steps:
+        out += ("\n[생각의 흐름]\n답을 쓰기 전에 다음 순서로 생각한다. 생각 과정은 출력하지 않고 최종 프롬프트만 출력한다.\n"
+                + "\n".join(f"{i}. {t}" for i, t in enumerate(agent.steps, 1)) + "\n")
+    return out
 
 
 async def draft_prompt(cfg: AIConfig, agent: DraftAgent, row: Row, note: str, current: str,
@@ -967,10 +993,11 @@ class Settings:
     ai_timeout: float | None = None                 # None 이면 공급자 기본
     ai_context: bool = True                         # 에이전트 상황·저장소 내용을 초안 모델에 전달
     ai_agents: list[str] = field(default_factory=lambda: [DEFAULT_AGENT])  # 작성 에이전트 id 들, 실행 순서 (마지막에 쓴 것으로 갱신)
+    agent_steps: dict[str, list[str]] = field(default_factory=dict)  # 에이전트별 생각의 흐름 (없는 id 는 에이전트 기본값)
     auto_abc: bool = True                           # macOS: 메인 화면에서 입력 소스를 영문으로 자동 전환
 
     FIELDS = ("interval", "orca", "local", "env", "host", "ssh",
-              "ai", "ai_model", "ai_timeout", "ai_context", "ai_agents", "auto_abc")
+              "ai", "ai_model", "ai_timeout", "ai_context", "ai_agents", "agent_steps", "auto_abc")
 
     @classmethod
     def load(cls, path: str) -> "Settings":
@@ -1034,6 +1061,13 @@ class Settings:
         if isinstance(v, str):
             v = _split_list(v)
         self.ai_agents = list(dict.fromkeys(str(x).strip() for x in (v or []) if str(x).strip())) or [DEFAULT_AGENT]
+        if not isinstance(self.agent_steps, dict):
+            errs.append("agent_steps 는 {에이전트 id: [단계, …]} 형태")
+            self.agent_steps = {}
+        else:
+            self.agent_steps = {str(k): [str(x).strip() for x in (v if isinstance(v, (list, tuple)) else [v])
+                                         if str(x).strip()]
+                                for k, v in self.agent_steps.items() if str(k).strip()}
         self.auto_abc = bool(self.auto_abc)
         if not self.local and not (self.env or self.host or self.ssh):
             errs.append("조회할 소스가 없음 (로컬을 끄면 env/host/ssh 중 하나 필요)")
@@ -1241,7 +1275,18 @@ class SettingsScreen(ModalScreen[Settings | None]):
         border: thick $primary; background: $surface; padding: 1 2;
     }
     SettingsScreen #path, SettingsScreen #override { color: $text-muted; height: auto; }
-    SettingsScreen #form { height: 1fr; }
+    SettingsScreen TabbedContent, SettingsScreen ContentSwitcher, SettingsScreen TabPane { height: 1fr; }
+    SettingsScreen TabPane { padding: 0; }
+    SettingsScreen #form, SettingsScreen #agent-form { height: 1fr; }
+    SettingsScreen #agent-desc, SettingsScreen #agent-role { color: $text-muted; height: auto; margin-left: 20; }
+    SettingsScreen #agent-role { max-height: 6; overflow-y: auto; }
+    SettingsScreen #steps { height: auto; }
+    SettingsScreen .step { height: 3; }
+    SettingsScreen .step > Label { width: 4; padding-top: 1; text-align: right; }
+    SettingsScreen .step Input { width: 1fr; }
+    SettingsScreen .step Button { min-width: 5; width: 5; margin-left: 1; }
+    SettingsScreen #step-buttons { height: auto; margin-left: 4; }
+    SettingsScreen #step-buttons Button { margin-left: 0; margin-right: 1; }
     SettingsScreen .section { color: $accent; text-style: bold; margin-top: 1; }
     SettingsScreen .row { height: 3; }
     SettingsScreen .row Label { width: 20; padding-top: 1; }
@@ -1262,6 +1307,11 @@ class SettingsScreen(ModalScreen[Settings | None]):
         self.path = path
         self.overrides = list(overrides)
         self.file_mode = file_mode
+        # 에이전트 탭: 생각의 흐름 편집 상태. base 는 설정 덮어쓰기 전(내장·md 파일) 기본값.
+        self.base_agents, _ = load_agents(path)
+        self.agents, _ = load_agents(path, settings.agent_steps)
+        self.steps: dict[str, list[str]] = {a.id: list(a.steps) for a in self.agents}
+        self.cur_agent: str = pick_agents(self.agents, settings.ai_agents)[0].id
 
     def compose(self) -> ComposeResult:
         s = self.settings
@@ -1281,6 +1331,17 @@ class SettingsScreen(ModalScreen[Settings | None]):
             if self.file_mode:
                 note += (" " if note else "") + "--file 모드라서 소스 설정은 저장만 되고 이번 실행에는 적용되지 않습니다."
             yield Label(note, id="override")
+            with TabbedContent(initial="tab-general"):
+                with TabPane("일반", id="tab-general"):
+                    yield from self._compose_general(s, row)
+                with TabPane("에이전트", id="tab-agents"):
+                    yield from self._compose_agents(row)
+            yield Label("", id="form-error")
+            with Horizontal(id="buttons"):
+                yield Button("취소 (Esc)", id="cancel")
+                yield Button("저장·적용 (Enter)", id="save", variant="primary")
+
+    def _compose_general(self, s: Settings, row) -> ComposeResult:
             with VerticalScroll(id="form"):
                 yield Label("조회", classes="section")
                 yield from row("조회 간격(초)", Input(str(s.interval), type="integer", id="interval"))
@@ -1296,20 +1357,74 @@ class SettingsScreen(ModalScreen[Settings | None]):
                                                  placeholder="비우면 기본 (claude 60 · codex 90)", id="ai_timeout"))
                 yield from row("에이전트 상황 전달", Checkbox("지시·마지막 응답·저장소 내용(목표 문서·변경분)을 초안 모델에 전달",
                                                       s.ai_context, id="ai_context"))
-                agents, _ = load_agents(self.path)
                 yield from row("작성 에이전트", Input(" ".join(s.ai_agents), id="ai_agents",
                                                  placeholder="id 를 실행 순서대로, 공백 구분 (예: goal review)"))
-                yield Label("사용 가능: " + " · ".join(f"{a.id}({a.name})" for a in agents)
+                yield Label("사용 가능: " + " · ".join(f"{a.id}({a.name})" for a in self.agents)
                             + f"\n추가: {agents_dir(self.path)}/<id>.md (frontmatter name·description·context + 지시문). "
-                              "프롬프트 창에서도 체크해 고를 수 있음", classes="hint")
+                              "프롬프트 창에서도 체크해 고를 수 있음 · 생각의 흐름은 「에이전트」 탭", classes="hint")
                 yield Label("키보드", classes="section")
                 yield from row("영문 자동 전환", Checkbox(
                     "메인 화면이 앞에 있을 때 입력 소스를 영문으로 바꿔 한글 상태에서도 단축키가 듣게 함 (macOS)",
                     s.auto_abc, id="auto_abc"))
-            yield Label("", id="form-error")
-            with Horizontal(id="buttons"):
-                yield Button("취소 (Esc)", id="cancel")
-                yield Button("저장·적용 (Enter)", id="save", variant="primary")
+
+    def _compose_agents(self, row) -> ComposeResult:
+        a = pick_agent(self.agents, self.cur_agent)
+        with VerticalScroll(id="agent-form"):
+            yield from row("에이전트", Select([(x.label, x.id) for x in self.agents], value=a.id,
+                                          allow_blank=False, id="agent-pick"))
+            yield Label(self._agent_desc(a), id="agent-desc")
+            yield Static(a.instructions.strip(), id="agent-role")
+            yield Label("생각의 흐름  (답을 쓰기 전에 이 순서로 생각하고 최종 프롬프트만 출력)", classes="section")
+            with Vertical(id="steps"):
+                yield from self._step_rows(self.steps[a.id])
+            with Horizontal(id="step-buttons"):
+                yield Button("+ 단계 추가", id="step-add")
+                yield Button("기본값으로", id="step-reset")
+
+    def _agent_desc(self, a: DraftAgent) -> str:
+        where = "내장" if a.builtin else f"파일 {a.path}"
+        return f"{a.description or '-'}  ·  {where}  ·  컨텍스트: {', '.join(a.context)}"
+
+    def _step_rows(self, steps: list[str]) -> list:
+        """단계 편집 행 위젯들. compose 와 mount 양쪽에서 쓰므로 컨텍스트 매니저 대신 직접 만든다."""
+        if not steps:
+            return [Label("(단계 없음 — 역할 지시문만으로 작성)", classes="hint", id="steps-empty")]
+        return [Horizontal(Label(f"{i + 1}."), Input(text, placeholder="생각 단계", classes="step-input"),
+                           Button("-", id=f"step-del-{i}", variant="error"), classes="step")
+                for i, text in enumerate(steps)]
+
+    def _sync_steps(self) -> None:
+        """에이전트 탭의 Input 내용을 현재 에이전트의 단계 목록으로 읽어 둔다."""
+        self.steps[self.cur_agent] = [i.value for i in self.query(".step-input")]
+
+    async def _render_steps(self, focus_last: bool = False) -> None:
+        box = self.query_one("#steps", Vertical)
+        await box.remove_children()
+        await box.mount(*self._step_rows(self.steps[self.cur_agent]))
+        if focus_last:
+            inputs = list(self.query(".step-input"))
+            if inputs:
+                inputs[-1].focus()
+
+    async def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id != "agent-pick" or event.value is Select.BLANK or str(event.value) == self.cur_agent:
+            return
+        self._sync_steps()
+        self.cur_agent = str(event.value)
+        a = pick_agent(self.agents, self.cur_agent)
+        self.query_one("#agent-desc", Label).update(self._agent_desc(a))
+        self.query_one("#agent-role", Static).update(a.instructions.strip())
+        await self._render_steps()
+
+    def _collect_steps(self) -> dict[str, list[str]]:
+        """기본값과 다른 에이전트만 저장한다 (없는 id = 기본값). 빈 목록은 '단계 없음'으로 저장."""
+        self._sync_steps()
+        out: dict[str, list[str]] = {}
+        for base in self.base_agents:
+            steps = [t.strip() for t in self.steps.get(base.id, []) if t.strip()]
+            if steps != list(base.steps):
+                out[base.id] = steps
+        return out
 
     def on_mount(self) -> None:
         self.query_one("#interval", Input).focus()
@@ -1326,13 +1441,14 @@ class SettingsScreen(ModalScreen[Settings | None]):
             ai_timeout=q("#ai_timeout", Input).value,
             ai_context=q("#ai_context", Checkbox).value,
             ai_agents=q("#ai_agents", Input).value,
+            agent_steps=self._collect_steps(),
             auto_abc=q("#auto_abc", Checkbox).value,
         )
 
     def action_save(self) -> None:
         new = self._collect()
         errs = new.validate()
-        known = {a.id for a in load_agents(self.path)[0]}
+        known = {a.id for a in self.agents}
         unknown = [i for i in new.ai_agents if i not in known]
         if unknown:
             errs.append(f"모르는 작성 에이전트: {', '.join(unknown)}")
@@ -1352,11 +1468,25 @@ class SettingsScreen(ModalScreen[Settings | None]):
     def on_input_submitted(self, event: Input.Submitted) -> None:
         self.action_save()
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "save":
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id or ""
+        if bid == "save":
             self.action_save()
-        else:
+        elif bid == "cancel":
             self.dismiss(None)
+        elif bid == "step-add":
+            self._sync_steps()
+            self.steps[self.cur_agent].append("")
+            await self._render_steps(focus_last=True)
+        elif bid == "step-reset":
+            base = pick_agent(self.base_agents, self.cur_agent)
+            self.steps[self.cur_agent] = list(base.steps)
+            await self._render_steps()
+        elif bid.startswith("step-del-"):
+            self._sync_steps()
+            idx = int(bid.rsplit("-", 1)[1])
+            del self.steps[self.cur_agent][idx]
+            await self._render_steps()
 
 
 class OrcaDash(App):
@@ -1661,7 +1791,7 @@ class OrcaDash(App):
             return
 
         repo_dir = row.path if (src.label == "local" and row.path and os.path.isdir(row.path)) else None
-        agents, agent_errors = load_agents(self.config_path)  # 열 때마다 읽어 새 파일이 바로 보이게
+        agents, agent_errors = load_agents(self.config_path, self.settings.agent_steps)  # 열 때마다 읽어 새 파일이 바로 보이게
         screen = PromptScreen(row, self.ai, repo_dir or tempfile.gettempdir(), repo_dir=repo_dir,
                               agents=agents, agent_ids=self.settings.ai_agents, agent_errors=agent_errors)
 
