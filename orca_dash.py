@@ -9,6 +9,8 @@ Orca 1.4.230 출력 구조 기준으로 작성.
              (모달에서 Enter 전송 · Ctrl+J 또는 Shift+Enter 줄바꿈 · Esc 취소)
   Ctrl+G     프롬프트 창에서 AI(로컬 claude -p 또는 codex exec)가 초안 작성.
              메모를 적고 누르면 초안 생성, 다시 누르면 현재 내용을 다듬기. --ai 옵션 참고
+             프롬프트 창의 '작성 에이전트'로 관점을 고른다: 목표 지향(goal, 프로젝트 목표 문서 기준) ·
+             문제 발견(review, git 변경분에서 문제를 찾음). ~/.config/orca-dash/agents/<id>.md 로 추가 가능
   o          옵션 보기/수정 (조회 간격·소스·AI). 저장하면 설정 파일에 쓰고 바로 적용
   r 새로고침 · f 필터 · e 빈 워크트리 · q 종료
   macOS 에서는 메인 화면이 앞에 있을 때 입력 소스를 영문(ABC)으로 자동 전환하고, 프롬프트·옵션 창을
@@ -32,6 +34,7 @@ import asyncio
 import difflib
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -333,14 +336,149 @@ class DraftError(Exception):
 DRAFT_SYSTEM = """\
 너는 코딩 에이전트(Claude Code, Codex 등)에게 보낼 프롬프트를 대신 작성하는 도우미다.
 아래 '에이전트 상황'과 '사용자 메모'를 바탕으로, 에이전트에게 그대로 보낼 프롬프트 본문만 한국어로 출력한다.
+그 아래 [역할]에 적힌 관점으로 쓴다.
 
 규칙:
 - 서문, 설명, 제목, 코드 펜스, 따옴표 없이 프롬프트 본문만 출력한다.
-- 1~6문장으로 구체적이고 바로 실행 가능하게 쓴다. 파일 경로나 명령은 상황에 있는 것만 쓴다.
+- 보통 1~6문장으로 구체적이고 바로 실행 가능하게 쓴다. 지적할 항목이 여럿이면 '- '로 시작하는 목록을 써도 된다.
+- 파일 경로나 명령은 상황에 있는 것만 쓴다. 추측한 파일·코드는 적지 않는다.
 - 에이전트가 '입력 대기'나 '권한 대기' 상태면 마지막 응답의 질문이나 요청에 답하는 내용으로 쓴다.
 - 사용자 메모가 비어 있으면 상황에 맞는 다음 지시를 제안한다.
 - '기존 초안'이 있으면 그것을 사용자 메모의 의도대로 다듬어 완성본만 다시 출력한다.
 """
+
+# 컨텍스트 제공자 id. status 는 항상 들어가고, 나머지는 작성 에이전트가 고른다.
+CONTEXT_PROVIDERS = {
+    "instruction": "에이전트에게 준 원래 지시",
+    "last_message": "마지막 응답과 현재 도구",
+    "goal": "프로젝트 목표 문서 (GOAL.md · docs/GOAL.md · .orca-dash/goal.md, 없으면 README 앞부분)",
+    "diff": "작업 중 변경분과 main 대비 변경분 (git diff)",
+    "log": "최근 커밋 10개 (git log)",
+}
+GOAL_FILES = ("GOAL.md", "docs/GOAL.md", ".orca-dash/goal.md")
+
+
+@dataclass
+class DraftAgent:
+    """AI 초안을 쓰는 '작성 에이전트': 역할 지시문 + 필요한 컨텍스트 목록.
+
+    공급자(claude/codex)·모델·제한 시간은 전역 설정이고, 에이전트는 '무엇을 보고 어떤 관점으로 쓸지'만 정한다.
+    내장 에이전트 외에 <설정 디렉터리>/agents/<id>.md 로 추가할 수 있다 (load_user_agents 참고).
+    """
+    id: str
+    name: str
+    description: str
+    instructions: str
+    context: tuple[str, ...]
+    builtin: bool = True
+    path: str = ""  # 사용자 정의 파일 경로
+
+    @property
+    def label(self) -> str:
+        return f"{self.name} — {self.description}" if self.description else self.name
+
+
+BUILTIN_AGENTS: list[DraftAgent] = [
+    DraftAgent(
+        id="goal", name="목표 지향",
+        description="프로젝트 목표 문서에 비추어 다음 지시를 쓴다",
+        context=("instruction", "last_message", "goal"),
+        instructions="""\
+역할: 프로젝트의 목표를 향해 작업을 이끄는 리드.
+- '프로젝트 목표'가 있으면 이번 작업이 그중 어느 항목에 기여하는지 한 문장으로 짚고, 목표에서 벗어난 작업은 되돌리거나 범위를 좁히도록 지시한다.
+- 마지막 응답이 질문이나 선택지를 담고 있으면 목표에 가장 부합하는 쪽으로 답한다.
+- 다음 단계는 목표 달성에 가장 가까운 한 가지로 좁혀 구체적으로 지시한다.
+- 목표 문서가 없으면 원래 지시를 목표로 삼는다.
+"""),
+    DraftAgent(
+        id="review", name="문제 발견",
+        description="변경분에서 버그·누락·테스트 공백을 찾아 수정 지시를 쓴다",
+        context=("instruction", "last_message", "diff", "log"),
+        instructions="""\
+역할: 변경된 코드에서 문제를 찾는 리뷰어.
+- '변경분'을 읽고 버그, 빠진 예외 처리, 경계 조건, 동시성·자원 누수, 테스트 공백, 원래 지시와 어긋난 구현을 찾는다.
+- 찾은 문제는 파일 경로(가능하면 함수명)와 함께 무엇이 왜 문제인지 한 줄씩 적고, 고치라는 지시로 마무리한다.
+- 문제가 없으면 테스트나 확인 절차를 추가하라는 지시를 쓴다. 변경분이 없으면 마지막 응답을 바탕으로 검증을 요청한다.
+"""),
+]
+DEFAULT_AGENT = BUILTIN_AGENTS[0].id
+
+
+def agents_dir(config_path: str) -> str:
+    return os.path.join(os.path.dirname(config_path) or ".", "agents")
+
+
+def parse_agent_file(path: str) -> DraftAgent:
+    """agents/<id>.md 를 읽는다. 형식:
+
+        ---
+        name: 테스트 작성                 (필수)
+        description: 변경분에 맞는 테스트  (선택)
+        context: diff, log               (선택, 기본 instruction, last_message)
+        ---
+        역할 지시문 본문…
+
+    잘못되면 ConfigError.
+    """
+    agent_id = os.path.splitext(os.path.basename(path))[0]
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", agent_id):
+        raise ConfigError(f"{path}: 파일 이름(id)은 영문·숫자·-_ 만")
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    meta: dict[str, str] = {}
+    body = text
+    lines = text.splitlines()
+    if lines and lines[0].strip() == "---":
+        # 닫는 줄은 정확히 '---' 인 줄 (본문의 '----' 구분선 등과 혼동하지 않도록)
+        close = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
+        if close is None:
+            raise ConfigError(f"{path}: frontmatter 를 닫는 --- 가 없음")
+        for line in lines[1:close]:
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            if ":" not in line:
+                raise ConfigError(f"{path}: frontmatter 줄 형식 오류 — {line.strip()}")
+            k, v = line.split(":", 1)
+            meta[k.strip().lower()] = v.strip()
+        body = "\n".join(lines[close + 1:])
+    name = meta.get("name", "").strip()
+    if not name:
+        raise ConfigError(f"{path}: frontmatter 에 name 이 필요함")
+    ctx = tuple(_split_list(meta["context"])) if "context" in meta else ("instruction", "last_message")
+    bad = [c for c in ctx if c not in CONTEXT_PROVIDERS]
+    if bad:
+        raise ConfigError(f"{path}: 모르는 context — {', '.join(bad)} (가능: {', '.join(CONTEXT_PROVIDERS)})")
+    if not body.strip():
+        raise ConfigError(f"{path}: 지시문 본문이 비어 있음")
+    return DraftAgent(id=agent_id, name=name, description=meta.get("description", "").strip(),
+                      instructions=body.strip() + "\n", context=ctx, builtin=False, path=path)
+
+
+def load_agents(config_path: str) -> tuple[list[DraftAgent], list[str]]:
+    """내장 에이전트에 사용자 정의(agents/*.md)를 합친다. 같은 id 면 사용자 정의가 내장을 덮는다.
+    잘못된 파일은 건너뛰고 오류 메시지 목록으로 돌려준다."""
+    agents = {a.id: a for a in BUILTIN_AGENTS}
+    errors: list[str] = []
+    d = agents_dir(config_path)
+    try:
+        names = sorted(n for n in os.listdir(d) if n.endswith(".md"))
+    except OSError:
+        names = []
+    for n in names:
+        try:
+            a = parse_agent_file(os.path.join(d, n))
+        except (ConfigError, OSError) as e:
+            errors.append(str(e))
+            continue
+        agents[a.id] = a
+    return list(agents.values()), errors
+
+
+def pick_agent(agents: list[DraftAgent], agent_id: str | None) -> DraftAgent:
+    for a in agents:
+        if a.id == agent_id:
+            return a
+    return agents[0]
 
 
 def _clip(text: str, limit: int) -> str:
@@ -348,7 +486,79 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit] + "\n…(이하 생략)"
 
 
-def build_draft_request(row: Row, note: str, current: str, include_context: bool) -> str:
+async def _git(repo_dir: str, *args: str, timeout: float = 10) -> str:
+    """git 명령 stdout. 실패·시간 초과면 빈 문자열."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "-C", repo_dir, *args, stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except (OSError, asyncio.TimeoutError):
+        return ""
+    return out.decode(errors="replace") if proc.returncode == 0 else ""
+
+
+def _read_goal(repo_dir: str) -> tuple[str, str] | None:
+    """(파일 이름, 내용). 목표 문서가 없으면 README 앞부분, 그것도 없으면 None."""
+    for rel in GOAL_FILES:
+        fp = os.path.join(repo_dir, rel)
+        if os.path.isfile(fp):
+            try:
+                with open(fp, encoding="utf-8", errors="replace") as f:
+                    return rel, _clip(f.read(), 4000)
+            except OSError:
+                pass
+    fp = os.path.join(repo_dir, "README.md")
+    if os.path.isfile(fp):
+        try:
+            with open(fp, encoding="utf-8", errors="replace") as f:
+                head = "".join(f.readlines()[:40])
+            return "README.md 앞부분 (목표 문서 없음)", _clip(head, 2500)
+        except OSError:
+            pass
+    return None
+
+
+async def _repo_context(provider: str, repo_dir: str | None) -> list[str]:
+    """저장소를 읽는 제공자(goal·diff·log). 원격 호스트라 경로가 없으면 생략 사유를 적는다."""
+    title = {"goal": "[프로젝트 목표]", "diff": "[변경분]", "log": "[최근 커밋]"}[provider]
+    if not repo_dir or not os.path.isdir(repo_dir):
+        return ["", title, "(원격 호스트라 로컬에서 읽을 수 없어 생략)"]
+    if provider == "goal":
+        g = _read_goal(repo_dir)
+        return ["", f"[프로젝트 목표] ({g[0]})", g[1]] if g else ["", title, "(목표 문서·README 없음)"]
+    if provider == "log":
+        log = await _git(repo_dir, "log", "--oneline", "-n", "10")
+        return ["", title, _clip(log, 1500) or "(없음)"]
+    # diff: 작업 중 변경(스테이지 포함) + 추적 안 된 파일 + main 대비 브랜치 변경
+    out = ["", title]
+    stat = await _git(repo_dir, "diff", "HEAD", "--stat")
+    body = await _git(repo_dir, "diff", "HEAD")
+    untracked = await _git(repo_dir, "ls-files", "--others", "--exclude-standard")
+    if stat.strip() or untracked.strip():
+        out += ["(작업 중, 커밋 전)", _clip(stat, 800)]
+        if untracked.strip():
+            out += ["추적 안 된 파일: " + _clip(" ".join(untracked.split()), 500)]
+        out += [_clip(body, 6000)]
+    else:
+        out += ["(커밋 전 변경 없음)"]
+    base = None
+    for b in ("main", "master"):
+        if (await _git(repo_dir, "rev-parse", "--verify", "-q", b)).strip():
+            base = b
+            break
+    cur = (await _git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD")).strip()
+    if base and cur and cur != base:
+        bstat = await _git(repo_dir, "diff", f"{base}...HEAD", "--stat")
+        if bstat.strip():
+            out += ["", f"({base} 대비 이 브랜치의 커밋된 변경)", _clip(bstat, 800),
+                    _clip(await _git(repo_dir, "diff", f"{base}...HEAD"), 4000)]
+    return out
+
+
+async def build_draft_request(agent: DraftAgent, row: Row, note: str, current: str,
+                              include_context: bool, repo_dir: str | None) -> str:
+    """에이전트가 고른 제공자로 요청 본문을 조립한다. include_context 가 꺼져 있으면 상태만 보낸다."""
     label = STATE_STYLE.get(row.state, (row.state or "?",))[0]
     lines = ["[에이전트 상황]",
              f"저장소/워크트리/브랜치: {row.repo} / {row.worktree} ({row.branch})",
@@ -356,10 +566,15 @@ def build_draft_request(row: Row, note: str, current: str, include_context: bool
     if include_context:
         if row.path:
             lines.append(f"경로: {row.path}")
-        lines += ["", "[원래 지시]", _clip(row.prompt, 1500) or "-"]
-        if row.tool:
-            lines += ["", f"[현재 도구] {row.tool}", _clip(row.tool_input, 300)]
-        lines += ["", "[마지막 응답]", _clip(row.last_message, 2000) or "-"]
+        for prov in agent.context:
+            if prov == "instruction":
+                lines += ["", "[원래 지시]", _clip(row.prompt, 1500) or "-"]
+            elif prov == "last_message":
+                if row.tool:
+                    lines += ["", f"[현재 도구] {row.tool}", _clip(row.tool_input, 300)]
+                lines += ["", "[마지막 응답]", _clip(row.last_message, 2000) or "-"]
+            elif prov in ("goal", "diff", "log"):
+                lines += await _repo_context(prov, repo_dir)
     lines += ["", "[사용자 메모]", note.strip() or "(없음 — 상황에 맞는 다음 지시를 제안)"]
     if current.strip():
         lines += ["", "[기존 초안]", current.strip()]
@@ -404,12 +619,18 @@ async def _run_cli(cmd: list[str], stdin: str, cwd: str | None, timeout: float) 
     return out.decode(errors="replace")
 
 
-async def draft_prompt(cfg: AIConfig, row: Row, note: str, current: str, cwd: str | None) -> str:
+def draft_system_prompt(agent: DraftAgent) -> str:
+    return DRAFT_SYSTEM + "\n[역할]\n" + agent.instructions.strip() + "\n"
+
+
+async def draft_prompt(cfg: AIConfig, agent: DraftAgent, row: Row, note: str, current: str,
+                       cwd: str | None, repo_dir: str | None = None) -> str:
     """AI 로 프롬프트 초안을 만든다. 실패 시 DraftError."""
-    request = build_draft_request(row, note, current, cfg.include_context)
+    request = await build_draft_request(agent, row, note, current, cfg.include_context, repo_dir)
+    system = draft_system_prompt(agent)
     if cfg.provider == "claude":
         cmd = ["claude", "-p", "--no-session-persistence", "--tools", "", "--output-format", "json",
-               "--system-prompt", DRAFT_SYSTEM]
+               "--system-prompt", system]
         if cfg.model:
             cmd += ["--model", cfg.model]
         raw = await _run_cli(cmd, request, cwd, cfg.timeout)
@@ -431,7 +652,7 @@ async def draft_prompt(cfg: AIConfig, row: Row, note: str, current: str, cwd: st
             if cfg.model:
                 cmd += ["-m", cfg.model]
             cmd.append("-")  # 프롬프트는 stdin
-            await _run_cli(cmd, DRAFT_SYSTEM + "\n\n" + request, cwd, cfg.timeout)
+            await _run_cli(cmd, system + "\n\n" + request, cwd, cfg.timeout)
             with open(out_path, encoding="utf-8", errors="replace") as f:
                 text = strip_fences(f.read())
         finally:
@@ -484,7 +705,10 @@ class PromptScreen(ModalScreen[str | None]):
     }
     PromptScreen #target { color: $text-muted; }
     PromptScreen #ai-status { color: $warning; height: 1; margin-bottom: 1; }
-    PromptScreen TextArea { height: 10; }
+    PromptScreen #agent-row { height: auto; margin-top: 0; align-horizontal: left; }
+    PromptScreen #agent-row Label { width: auto; padding: 1 1 0 0; }
+    PromptScreen #agent-row Select { width: 1fr; }
+    PromptScreen TextArea { height: 8; }
     PromptScreen Horizontal { height: auto; margin-top: 1; align-horizontal: right; }
     PromptScreen Button { margin-left: 1; }
     """
@@ -494,11 +718,17 @@ class PromptScreen(ModalScreen[str | None]):
         Binding("ctrl+s", "send", "보내기", show=False, priority=True),  # 터미널이 전달해 주는 경우에만
     ]
 
-    def __init__(self, row: Row, ai: AIConfig | None = None, cwd: str | None = None):
+    def __init__(self, row: Row, ai: AIConfig | None = None, cwd: str | None = None, *,
+                 repo_dir: str | None = None, agents: list[DraftAgent] | None = None,
+                 agent_id: str | None = None, agent_errors: list[str] = ()):
         super().__init__()
         self.row = row
         self.ai = ai if ai and ai.enabled else None
         self.cwd = cwd
+        self.repo_dir = repo_dir            # 로컬 저장소 경로 (goal·diff·log 제공자용), 원격이면 None
+        self.agents = agents or list(BUILTIN_AGENTS)
+        self.agent_id = pick_agent(self.agents, agent_id).id
+        self.agent_errors = list(agent_errors)
         self.note: str | None = None        # AI 에 준 사용자 메모 (다듬기 때 재사용)
         self.last_draft: str | None = None  # 마지막으로 받은 초안
         self.draft_worker: Worker | None = None
@@ -511,6 +741,11 @@ class PromptScreen(ModalScreen[str | None]):
             yield Label(f"대상: [{r.host}] {r.repo} / {r.worktree} ({r.branch}) · {r.agent_type}"
                         + (f" · 현재 {r.tool}" if r.tool else ""), id="target")
             yield Label("", id="ai-status")
+            if self.ai:
+                with Horizontal(id="agent-row"):
+                    yield Label("작성 에이전트")
+                    yield Select([(a.label, a.id) for a in self.agents], value=self.agent_id,
+                                 allow_blank=False, id="agent")
             yield PromptArea(id="prompt")
             with Horizontal():
                 yield Button("취소 (Esc)", id="cancel")
@@ -520,6 +755,17 @@ class PromptScreen(ModalScreen[str | None]):
 
     def on_mount(self) -> None:
         self.query_one(TextArea).focus()
+        if self.ai and self.agent_errors:
+            self._set_ai_status(f"에이전트 파일 오류 {len(self.agent_errors)}건 (건너뜀): {self.agent_errors[0]}")
+
+    @property
+    def agent(self) -> DraftAgent:
+        return pick_agent(self.agents, self.agent_id)
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "agent" and event.value is not Select.BLANK:
+            self.agent_id = str(event.value)
+            self.query_one(TextArea).focus()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         if action == "draft" and not self.ai:
@@ -545,7 +791,7 @@ class PromptScreen(ModalScreen[str | None]):
         else:
             note, current, what = text, "", "초안 작성 중"              # 메모로 새 초안
             self.note = note
-        self._set_ai_status(f"AI {what}… ({self.ai.provider}, Esc 중단 · Ctrl+G 다시 시작)")
+        self._set_ai_status(f"AI {what}… ({self.agent.name} · {self.ai.provider}, Esc 중단 · Ctrl+G 다시 시작)")
         self.draft_worker = self.run_worker(
             self._draft(note, current), group="draft", exclusive=True, exit_on_error=False,
         )
@@ -560,7 +806,7 @@ class PromptScreen(ModalScreen[str | None]):
 
     async def _draft(self, note: str, current: str) -> str:
         assert self.ai is not None
-        return await draft_prompt(self.ai, self.row, note, current, self.cwd)
+        return await draft_prompt(self.ai, self.agent, self.row, note, current, self.cwd, self.repo_dir)
 
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
         if event.worker.group != "draft" or event.worker is not self.draft_worker:
@@ -571,7 +817,7 @@ class PromptScreen(ModalScreen[str | None]):
             area.load_text(draft)
             area.move_cursor(area.document.end)
             self.last_draft = draft
-            self._set_ai_status("AI 초안을 넣었습니다. 수정 후 Enter 로 전송 · Ctrl+G 로 다듬기")
+            self._set_ai_status(f"AI 초안({self.agent.name})을 넣었습니다. 수정 후 Enter 로 전송 · Ctrl+G 로 다듬기")
         elif event.state == WorkerState.ERROR:
             err = event.worker.error
             self._set_ai_status("")
@@ -642,11 +888,12 @@ class Settings:
     ai: str = "auto"                                # auto | claude | codex | off
     ai_model: str = ""                              # 빈 값이면 공급자 기본
     ai_timeout: float | None = None                 # None 이면 공급자 기본
-    ai_context: bool = True                         # 에이전트 상황을 초안 모델에 전달
+    ai_context: bool = True                         # 에이전트 상황·저장소 내용을 초안 모델에 전달
+    ai_agent: str = DEFAULT_AGENT                   # 기본 작성 에이전트 id (마지막에 쓴 것으로 갱신)
     auto_abc: bool = True                           # macOS: 메인 화면에서 입력 소스를 영문으로 자동 전환
 
     FIELDS = ("interval", "orca", "local", "env", "host", "ssh",
-              "ai", "ai_model", "ai_timeout", "ai_context", "auto_abc")
+              "ai", "ai_model", "ai_timeout", "ai_context", "ai_agent", "auto_abc")
 
     @classmethod
     def load(cls, path: str) -> "Settings":
@@ -704,6 +951,7 @@ class Settings:
             except (TypeError, ValueError):
                 errs.append("AI 제한 시간은 수(초) 또는 빈 값")
         self.ai_context = bool(self.ai_context)
+        self.ai_agent = str(self.ai_agent or "").strip() or DEFAULT_AGENT
         self.auto_abc = bool(self.auto_abc)
         if not self.local and not (self.env or self.host or self.ssh):
             errs.append("조회할 소스가 없음 (로컬을 끄면 env/host/ssh 중 하나 필요)")
@@ -714,7 +962,8 @@ class Settings:
         over: list[str] = []
         for k, v in [("interval", args.interval), ("orca", args.orca), ("env", args.env),
                      ("host", args.host), ("ssh", args.ssh), ("ai", args.ai),
-                     ("ai_model", args.ai_model), ("ai_timeout", args.ai_timeout)]:
+                     ("ai_model", args.ai_model), ("ai_timeout", args.ai_timeout),
+                     ("ai_agent", getattr(args, "ai_agent", None))]:
             if v is not None:
                 setattr(self, k, v)
                 over.append(k)
@@ -915,6 +1164,7 @@ class SettingsScreen(ModalScreen[Settings | None]):
     SettingsScreen .row { height: 3; }
     SettingsScreen .row Label { width: 20; padding-top: 1; }
     SettingsScreen .row Input, SettingsScreen .row Select, SettingsScreen .row Checkbox { width: 1fr; }
+    SettingsScreen .hint { color: $text-muted; margin-left: 20; height: auto; }
     SettingsScreen #form-error { color: $error; height: auto; }
     SettingsScreen #buttons { height: auto; margin-top: 1; align-horizontal: right; }
     SettingsScreen Button { margin-left: 1; }
@@ -962,7 +1212,15 @@ class SettingsScreen(ModalScreen[Settings | None]):
                 yield from row("모델", Input(s.ai_model, placeholder="비우면 기본 (claude: haiku · codex: CLI 설정)", id="ai_model"))
                 yield from row("제한 시간(초)", Input("" if s.ai_timeout is None else f"{s.ai_timeout:g}", type="number",
                                                  placeholder="비우면 기본 (claude 60 · codex 90)", id="ai_timeout"))
-                yield from row("에이전트 상황 전달", Checkbox("지시·마지막 응답을 초안 모델에 전달", s.ai_context, id="ai_context"))
+                yield from row("에이전트 상황 전달", Checkbox("지시·마지막 응답·저장소 내용(목표 문서·변경분)을 초안 모델에 전달",
+                                                      s.ai_context, id="ai_context"))
+                agents, _ = load_agents(self.path)
+                yield from row("기본 작성 에이전트", Select([(a.label, a.id) for a in agents],
+                                                       value=pick_agent(agents, s.ai_agent).id,
+                                                       allow_blank=False, id="ai_agent"))
+                yield Label(f"에이전트 추가: {agents_dir(self.path)}/<id>.md "
+                            "(frontmatter name·description·context + 지시문 본문). 프롬프트 창에서도 고를 수 있음",
+                            classes="hint")
                 yield Label("키보드", classes="section")
                 yield from row("영문 자동 전환", Checkbox(
                     "메인 화면이 앞에 있을 때 입력 소스를 영문으로 바꿔 한글 상태에서도 단축키가 듣게 함 (macOS)",
@@ -986,6 +1244,7 @@ class SettingsScreen(ModalScreen[Settings | None]):
             ai_model=q("#ai_model", Input).value,
             ai_timeout=q("#ai_timeout", Input).value,
             ai_context=q("#ai_context", Checkbox).value,
+            ai_agent=str(q("#ai_agent", Select).value),
             auto_abc=q("#auto_abc", Checkbox).value,
         )
 
@@ -1316,13 +1575,22 @@ class OrcaDash(App):
             self.notify("파일 소스에서는 프롬프트를 보낼 수 없습니다.", severity="warning")
             return
 
+        repo_dir = row.path if (src.label == "local" and row.path and os.path.isdir(row.path)) else None
+        agents, agent_errors = load_agents(self.config_path)  # 열 때마다 읽어 새 파일이 바로 보이게
+        screen = PromptScreen(row, self.ai, repo_dir or tempfile.gettempdir(), repo_dir=repo_dir,
+                              agents=agents, agent_id=self.settings.ai_agent, agent_errors=agent_errors)
+
         def on_result(text: str | None) -> None:
+            if screen.agent_id != self.settings.ai_agent:
+                self.settings.ai_agent = screen.agent_id  # 마지막에 쓴 에이전트를 기본으로
+                try:
+                    self.settings.save(self.config_path)
+                except OSError:
+                    pass
             if text:
                 self.run_worker(self._send_prompt(src, row, text), exclusive=False)
 
-        cwd = row.path if (src.label == "local" and row.path and os.path.isdir(row.path)) \
-            else tempfile.gettempdir()
-        self._open_modal(PromptScreen(row, self.ai, cwd), on_result)
+        self._open_modal(screen, on_result)
 
     async def _send_prompt(self, src: Source, row: Row, text: str) -> None:
         target = f"{row.repo}/{row.worktree}"
@@ -1364,7 +1632,10 @@ def main() -> None:
     g.add_argument("--ai-model", help="모델 지정. claude 기본 haiku, codex 기본은 CLI 설정값")
     g.add_argument("--ai-timeout", type=float, help="초안 생성 제한 시간(초). 기본 claude 60, codex 90")
     g.add_argument("--ai-context", choices=["on", "off"],
-                   help="에이전트의 지시·마지막 응답을 초안 모델에 전달할지 (기본 on)")
+                   help="에이전트의 지시·마지막 응답과 저장소 내용(목표 문서·변경분)을 초안 모델에 전달할지 (기본 on)")
+    g.add_argument("--ai-agent", metavar="ID",
+                   help=f"기본 작성 에이전트. 내장: {', '.join(a.id for a in BUILTIN_AGENTS)}. "
+                        "<설정 디렉터리>/agents/<id>.md 로 추가 가능")
     args = p.parse_args()
     try:
         settings = Settings.load(args.config)
