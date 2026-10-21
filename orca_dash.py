@@ -339,7 +339,10 @@ class DraftError(Exception):
 DRAFT_SYSTEM = """\
 너는 코딩 에이전트(Claude Code, Codex 등)에게 보낼 프롬프트를 대신 작성하는 도우미다.
 아래 '에이전트 상황'과 '사용자 메모'를 바탕으로, 에이전트에게 그대로 보낼 프롬프트 본문만 한국어로 출력한다.
-그 아래 [역할]에 적힌 관점으로 쓴다.
+
+요청에는 [에이전트] JSON 이 함께 온다. "agent.character" 는 네 역할 id 이고 그 역할의 지시문은 아래 [역할]에 있다.
+"agent.think_steps" 는 답을 쓰기 전에 번호 순서대로 거치는 생각 단계다. 그 순서로 생각한 뒤, 생각 과정은
+출력하지 않고 최종 프롬프트만 출력한다.
 
 규칙:
 - 서문, 설명, 제목, 코드 펜스, 따옴표 없이 프롬프트 본문만 출력한다.
@@ -592,7 +595,8 @@ async def build_draft_request(agent: DraftAgent, row: Row, note: str, current: s
     label = STATE_STYLE.get(row.state, (row.state or "?",))[0]
     lines = ["[에이전트 상황]",
              f"저장소/워크트리/브랜치: {row.repo} / {row.worktree} ({row.branch})",
-             f"에이전트: {row.agent_type} · 상태: {label}" + (f" · 대기 사유: {row.wait}" if row.wait else "")]
+             f"에이전트: {row.agent_type} · 상태: {label}" + (f" · 대기 사유: {row.wait}" if row.wait else ""),
+             "", "[에이전트]", agent_json(agent)]
     if include_context:
         if row.path:
             lines.append(f"경로: {row.path}")
@@ -649,12 +653,15 @@ async def _run_cli(cmd: list[str], stdin: str, cwd: str | None, timeout: float) 
     return out.decode(errors="replace")
 
 
+def agent_json(agent: DraftAgent) -> str:
+    """요청에 함께 보내는 에이전트 명세. character 는 역할 id, think_steps 는 번호 키의 생각 단계."""
+    spec = {"agent": {"character": agent.id,
+                      "think_steps": {str(i): t for i, t in enumerate(agent.steps, 1)}}}
+    return json.dumps(spec, ensure_ascii=False, indent=2)
+
+
 def draft_system_prompt(agent: DraftAgent) -> str:
-    out = DRAFT_SYSTEM + "\n[역할]\n" + agent.instructions.strip() + "\n"
-    if agent.steps:
-        out += ("\n[생각의 흐름]\n답을 쓰기 전에 다음 순서로 생각한다. 생각 과정은 출력하지 않고 최종 프롬프트만 출력한다.\n"
-                + "\n".join(f"{i}. {t}" for i, t in enumerate(agent.steps, 1)) + "\n")
-    return out
+    return DRAFT_SYSTEM + f"\n[역할] (character: {agent.id})\n" + agent.instructions.strip() + "\n"
 
 
 async def draft_prompt(cfg: AIConfig, agent: DraftAgent, row: Row, note: str, current: str,
@@ -1374,7 +1381,8 @@ class SettingsScreen(ModalScreen[Settings | None]):
                                           allow_blank=False, id="agent-pick"))
             yield Label(self._agent_desc(a), id="agent-desc")
             yield Static(a.instructions.strip(), id="agent-role")
-            yield Label("생각의 흐름  (답을 쓰기 전에 이 순서로 생각하고 최종 프롬프트만 출력)", classes="section")
+            yield Label("생각의 흐름  (요청의 agent.think_steps 로 전달 — 답을 쓰기 전에 이 순서로 생각하고 최종 프롬프트만 출력)",
+                        classes="section")
             with Vertical(id="steps"):
                 yield from self._step_rows(self.steps[a.id])
             with Horizontal(id="step-buttons"):
