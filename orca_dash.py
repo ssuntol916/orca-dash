@@ -772,6 +772,12 @@ def split_draft(text: str, agents: list[DraftAgent]) -> dict[str, str]:
     return {aid: "\n".join(lines).strip() for aid, lines in found.items()}
 
 
+def has_section_headers(text: str, agents: list[DraftAgent]) -> bool:
+    """본문에 작성 에이전트의 '[이름]' 머리말이 하나라도 있으면 True (split_draft 는 없을 때 전체를 돌려주므로 구분용)."""
+    headers = {section_header(a) for a in agents}
+    return any(line.strip() in headers for line in text.splitlines())
+
+
 def split_run(agents: list[DraftAgent]) -> tuple[list[DraftAgent], DraftAgent | None]:
     """체크한 에이전트를 (작성 에이전트들, 최종 결정 에이전트) 로 나눈다. 결정 에이전트는 하나만 쓰며
     여럿 체크했으면 마지막으로 체크한 것."""
@@ -787,10 +793,11 @@ def run_order(agents: list[DraftAgent]) -> list[DraftAgent]:
 
 
 async def draft_each(cfg: AIConfig, agents: list[DraftAgent], row: Row, note: str, currents: dict[str, str],
-                     cwd: str | None, repo_dir: str | None = None, on_step=None) -> str:
+                     cwd: str | None, repo_dir: str | None = None, on_step=None, drafts: str = "") -> str:
     """작성 에이전트들이 각자 독립적으로(같은 상황·메모로) 초안을 쓰고 순서대로 묶는다. 최종 결정 에이전트가
     있으면 그 묶음을 [에이전트 초안]으로 받아 프롬프트 하나로 정하고, 그것이 결과가 된다.
-    currents 는 다듬기일 때 에이전트별 기존 초안. on_step(i, agent, text_so_far) 는 단계마다 호출."""
+    currents 는 다듬기일 때 에이전트별 기존 초안. on_step(i, agent, text_so_far) 는 단계마다 호출.
+    drafts 는 작성 에이전트를 돌리지 않을 때(입력창에 남아 있던 머리말 묶음을 다시 결정할 때) 결정 에이전트에게 줄 초안."""
     writers, decider = split_run(agents)
     parts: list[tuple[DraftAgent, str]] = []
     for i, agent in enumerate(writers):
@@ -801,7 +808,8 @@ async def draft_each(cfg: AIConfig, agents: list[DraftAgent], row: Row, note: st
     if decider is None:
         return combine_drafts(parts)
     # 결정 에이전트에게는 하나뿐이어도 누가 썼는지 보이도록 머리말을 붙인다
-    drafts = "\n\n".join(f"{section_header(a)}\n{t.strip()}" for a, t in parts)
+    if parts:
+        drafts = "\n\n".join(f"{section_header(a)}\n{t.strip()}" for a, t in parts)
     final = await draft_prompt(cfg, decider, row, note, currents.get(decider.id, ""), cwd, repo_dir, drafts=drafts)
     if on_step:
         on_step(len(writers), decider, final)
@@ -909,11 +917,12 @@ class PromptScreen(ModalScreen[str | None]):
 
     def _order_text(self) -> str:
         writers, decider = split_run(self.chain)
-        names = " → ".join(a.name + ("" if a.memo else "(메모 안 받음)") for a in writers)
+        tag = lambda a: a.name + ("" if a.memo else "(메모 안 받음)")
+        names = " → ".join(tag(a) for a in writers)
         if decider and writers:
-            return f"실행 순서: {names} ⇒ {decider.name}  (각자 쓴 초안을 {decider.name}이 하나로 정함)"
+            return f"실행 순서: {names} ⇒ {tag(decider)}  (각자 쓴 초안을 {decider.name}이 하나로 정함)"
         if decider:
-            return f"실행 순서: {decider.name}  (받을 초안이 없어 직접 작성)"
+            return f"실행 순서: {tag(decider)}  (받을 초안이 없어 직접 작성)"
         return f"실행 순서: {names}" + ("  (각자 독립적으로 쓰고 이 순서로 묶음)" if len(writers) > 1 else "")
 
     def on_selection_list_selected_changed(self, event: SelectionList.SelectedChanged) -> None:
@@ -976,10 +985,16 @@ class PromptScreen(ModalScreen[str | None]):
     async def _draft(self, note: str, current: str) -> str:
         assert self.ai is not None
         order = self._run_agents(current)
+        currents: dict[str, str] = {}
+        drafts = ""
         if not current.strip():
-            currents = {}
+            pass
         elif len(order) == 1 and order[0].final:
-            currents = {order[0].id: current}
+            writers, _ = split_run(self.chain)
+            if has_section_headers(current, writers):
+                drafts = current   # 결정 전에 중단됐거나 사용자가 고친 작성 에이전트 초안 묶음 → 그것으로 결정
+            else:
+                currents = {order[0].id: current}   # 이미 결정된 프롬프트 → 다듬기
         else:
             currents = split_draft(current, order)
 
@@ -988,10 +1003,12 @@ class PromptScreen(ModalScreen[str | None]):
             area = self.query_one(TextArea)
             area.load_text(combined)
             area.move_cursor(area.document.end)
+            self.last_draft = combined   # 중단·실패로 여기서 끝나도 다음 Ctrl+G 가 메모가 아닌 초안으로 본다
             if i + 1 < len(order):
                 self._set_ai_status(self._progress_text(order, i + 1, "작성 중"))
 
-        return await draft_each(self.ai, order, self.row, note, currents, self.cwd, self.repo_dir, on_step)
+        return await draft_each(self.ai, order, self.row, note, currents, self.cwd, self.repo_dir, on_step,
+                                drafts=drafts)
 
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
         if event.worker.group != "draft" or event.worker is not self.draft_worker:
