@@ -9,7 +9,7 @@ Orca 1.4.230 출력 구조 기준으로 작성.
              (모달에서 Enter 전송 · Ctrl+J 또는 Shift+Enter 줄바꿈 · Esc 취소)
   Ctrl+G     프롬프트 창에서 AI(로컬 claude -p 또는 codex exec)가 초안 작성.
              메모를 적고 누르면 초안 생성, 다시 누르면 현재 내용을 다듬기. --ai 옵션 참고
-             프롬프트 창의 '작성 에이전트'에서 관점을 체크한다: 목표 지향(goal, 프로젝트 목표 문서 기준) ·
+             프롬프트 창의 '작성 에이전트'에서 관점을 체크한다: 목표 지향(goal, 프로젝트 목표 문서 기준, 메모는 받지 않음) ·
              문제 발견(review, git 변경분에서 문제를 찾음). 여러 개를 체크하면 각자 독립적으로 초안을 쓰고
              체크한 순서로 '[이름]' 머리말을 붙여 묶는다. ~/.config/orca-dash/agents/<id>.md 로 추가 가능
   o          옵션 보기/수정 (조회 간격·소스·AI). 저장하면 설정 파일에 쓰고 바로 적용.
@@ -338,7 +338,7 @@ class DraftError(Exception):
 
 DRAFT_SYSTEM = """\
 너는 코딩 에이전트(Claude Code, Codex 등)에게 보낼 프롬프트를 대신 작성하는 도우미다.
-아래 '에이전트 상황'과 '사용자 메모'를 바탕으로, 에이전트에게 그대로 보낼 프롬프트 본문만 한국어로 출력한다.
+아래 '에이전트 상황'(그리고 있으면 '사용자 메모')을 바탕으로, 에이전트에게 그대로 보낼 프롬프트 본문만 한국어로 출력한다.
 
 요청에는 [에이전트] JSON 이 함께 온다. "agent.character" 는 네 역할 id 이고 그 역할의 지시문은 아래 [역할]에 있다.
 "agent.think_steps" 는 답을 쓰기 전에 번호 순서대로 거치는 생각 단계다. 그 순서로 생각한 뒤, 생각 과정은
@@ -349,8 +349,8 @@ DRAFT_SYSTEM = """\
 - 보통 1~6문장으로 구체적이고 바로 실행 가능하게 쓴다. 지적할 항목이 여럿이면 '- '로 시작하는 목록을 써도 된다.
 - 파일 경로나 명령은 상황에 있는 것만 쓴다. 추측한 파일·코드는 적지 않는다.
 - 에이전트가 '입력 대기'나 '권한 대기' 상태면 마지막 응답의 질문이나 요청에 답하는 내용으로 쓴다.
-- 사용자 메모가 비어 있으면 상황에 맞는 다음 지시를 제안한다.
-- '기존 초안'이 있으면 그것을 사용자 메모의 의도대로 다듬어 완성본만 다시 출력한다.
+- '사용자 메모' 절이 없거나 비어 있으면 상황에 맞는 다음 지시를 제안한다 (메모 절이 없는 역할은 메모를 받지 않는 역할이다).
+- '기존 초안'이 있으면 그것을 사용자 메모의 의도대로(메모가 없으면 더 구체적이고 짧게) 다듬어 완성본만 다시 출력한다.
 """
 
 # 컨텍스트 제공자 id. status 는 항상 들어가고, 나머지는 작성 에이전트가 고른다.
@@ -379,10 +379,12 @@ class DraftAgent:
     builtin: bool = True
     path: str = ""  # 사용자 정의 파일 경로
     steps: tuple[str, ...] = ()  # 생각의 흐름: 답을 쓰기 전에 순서대로 거치는 생각 단계 (옵션 > 에이전트 탭에서 편집)
+    memo: bool = True  # 사용자 메모를 요청에 넣을지. 메모가 방향을 흐리는 역할(목표 지향)은 끈다 — md 의 'memo: off'
 
     @property
     def label(self) -> str:
-        return f"{self.name} — {self.description}" if self.description else self.name
+        text = f"{self.name} — {self.description}" if self.description else self.name
+        return text if self.memo else f"{text} (메모 안 받음)"
 
 
 BUILTIN_AGENTS: list[DraftAgent] = [
@@ -390,6 +392,7 @@ BUILTIN_AGENTS: list[DraftAgent] = [
         id="goal", name="목표 지향",
         description="프로젝트 목표 문서에 비추어 다음 지시를 쓴다",
         context=("instruction", "last_message", "goal"),
+        memo=False,  # 메모가 있으면 목표 대신 메모를 좇아 억지로 목표에 끼워 맞추므로 받지 않는다
         steps=("프로젝트 목표(없으면 원래 지시)에서 이번 작업과 관련된 항목을 찾는다",
                "마지막 응답이 그 항목에 얼마나 다가갔는지, 벗어난 부분은 없는지 판단한다",
                "목표에 가장 가까워지는 다음 한 단계를 정한다",
@@ -431,6 +434,7 @@ def parse_agent_file(path: str) -> DraftAgent:
         description: 변경분에 맞는 테스트  (선택)
         context: diff, log               (선택, 기본 instruction, last_message)
         step: 바뀐 함수를 파악한다          (선택, 반복 가능 — 생각의 흐름 기본값. 옵션 > 에이전트 탭에서 덮어씀)
+        memo: off                        (선택, 기본 on — off 면 사용자 메모를 요청에 넣지 않음)
         ---
         역할 지시문 본문…
 
@@ -468,11 +472,14 @@ def parse_agent_file(path: str) -> DraftAgent:
     bad = [c for c in ctx if c not in CONTEXT_PROVIDERS]
     if bad:
         raise ConfigError(f"{path}: 모르는 context — {', '.join(bad)} (가능: {', '.join(CONTEXT_PROVIDERS)})")
+    memo_raw = meta.get("memo", "on").strip().lower()
+    if memo_raw not in ("on", "off", "yes", "no", "true", "false", "1", "0"):
+        raise ConfigError(f"{path}: memo 는 on 또는 off — {memo_raw}")
     if not body.strip():
         raise ConfigError(f"{path}: 지시문 본문이 비어 있음")
     return DraftAgent(id=agent_id, name=name, description=meta.get("description", "").strip(),
                       instructions=body.strip() + "\n", context=ctx, builtin=False, path=path,
-                      steps=tuple(x for x in steps if x))
+                      steps=tuple(x for x in steps if x), memo=memo_raw in ("on", "yes", "true", "1"))
 
 
 def load_agents(config_path: str,
@@ -609,7 +616,8 @@ async def build_draft_request(agent: DraftAgent, row: Row, note: str, current: s
                 lines += ["", "[마지막 응답]", _clip(row.last_message, 2000) or "-"]
             elif prov in ("goal", "diff", "log"):
                 lines += await _repo_context(prov, repo_dir)
-    lines += ["", "[사용자 메모]", note.strip() or "(없음 — 상황에 맞는 다음 지시를 제안)"]
+    if agent.memo:  # 메모를 받지 않는 에이전트(goal)는 절 자체를 넣지 않는다
+        lines += ["", "[사용자 메모]", note.strip() or "(없음 — 상황에 맞는 다음 지시를 제안)"]
     if current.strip():
         lines += ["", "[기존 초안]", current.strip()]
     return "\n".join(lines)
@@ -849,7 +857,7 @@ class PromptScreen(ModalScreen[str | None]):
         return pick_agents(self.agents, self.agent_ids)
 
     def _order_text(self) -> str:
-        names = " → ".join(a.name for a in self.chain)
+        names = " → ".join(a.name + ("" if a.memo else "(메모 안 받음)") for a in self.chain)
         return f"실행 순서: {names}" + ("  (각자 독립적으로 쓰고 이 순서로 묶음)" if len(self.chain) > 1 else "")
 
     def on_selection_list_selected_changed(self, event: SelectionList.SelectedChanged) -> None:
@@ -1391,7 +1399,8 @@ class SettingsScreen(ModalScreen[Settings | None]):
 
     def _agent_desc(self, a: DraftAgent) -> str:
         where = "내장" if a.builtin else f"파일 {a.path}"
-        return f"{a.description or '-'}  ·  {where}  ·  컨텍스트: {', '.join(a.context)}"
+        return (f"{a.description or '-'}  ·  {where}  ·  컨텍스트: {', '.join(a.context)}"
+                + ("" if a.memo else "  ·  사용자 메모: 받지 않음"))
 
     def _step_rows(self, steps: list[str]) -> list:
         """단계 편집 행 위젯들. compose 와 mount 양쪽에서 쓰므로 컨텍스트 매니저 대신 직접 만든다."""
