@@ -10,8 +10,9 @@ Orca 1.4.230 출력 구조 기준으로 작성.
   Ctrl+G     프롬프트 창에서 AI(로컬 claude -p 또는 codex exec)가 초안 작성.
              메모를 적고 누르면 초안 생성, 다시 누르면 현재 내용을 다듬기. --ai 옵션 참고
              프롬프트 창의 '작성 에이전트'에서 관점을 체크한다: 목표 지향(goal, 프로젝트 목표 문서 기준, 메모는 받지 않음) ·
-             문제 발견(review, git 변경분에서 문제를 찾음). 여러 개를 체크하면 각자 독립적으로 초안을 쓰고
-             체크한 순서로 '[이름]' 머리말을 붙여 묶는다. ~/.config/orca-dash/agents/<id>.md 로 추가 가능
+             문제 발견(review, git 변경분에서 문제를 찾음) · 최종 결정(final, 다른 초안들을 받아 하나로 정함).
+             여러 개를 체크하면 각자 독립적으로 초안을 쓰고 체크한 순서로 '[이름]' 머리말을 붙여 묶으며,
+             최종 결정을 함께 체크하면 그 묶음을 받아 프롬프트 하나로 정한다. ~/.config/orca-dash/agents/<id>.md 로 추가 가능
   o          옵션 보기/수정 (조회 간격·소스·AI). 저장하면 설정 파일에 쓰고 바로 적용.
              「에이전트」 탭에서 작성 에이전트별 '생각의 흐름'(답을 쓰기 전에 거치는 생각 단계)을 +/- 로 편집
   r 새로고침 · f 필터 · e 빈 워크트리 · q 종료
@@ -351,6 +352,8 @@ DRAFT_SYSTEM = """\
 - 에이전트가 '입력 대기'나 '권한 대기' 상태면 마지막 응답의 질문이나 요청에 답하는 내용으로 쓴다.
 - '사용자 메모' 절이 없거나 비어 있으면 상황에 맞는 다음 지시를 제안한다 (메모 절이 없는 역할은 메모를 받지 않는 역할이다).
 - '기존 초안'이 있으면 그것을 사용자 메모의 의도대로(메모가 없으면 더 구체적이고 짧게) 다듬어 완성본만 다시 출력한다.
+- '[에이전트 초안]' 절이 있으면 다른 작성 에이전트들이 '[이름]' 머리말로 구분해 쓴 초안이다. [역할]의 지시대로 그것을
+  평가해 에이전트에게 보낼 최종 프롬프트 하나만 쓴다. 머리말이나 출처 표시는 남기지 않는다.
 """
 
 # 컨텍스트 제공자 id. status 는 항상 들어가고, 나머지는 작성 에이전트가 고른다.
@@ -380,11 +383,13 @@ class DraftAgent:
     path: str = ""  # 사용자 정의 파일 경로
     steps: tuple[str, ...] = ()  # 생각의 흐름: 답을 쓰기 전에 순서대로 거치는 생각 단계 (옵션 > 에이전트 탭에서 편집)
     memo: bool = True  # 사용자 메모를 요청에 넣을지. 메모가 방향을 흐리는 역할(목표 지향)은 끈다 — md 의 'memo: off'
+    final: bool = False  # 최종 결정 에이전트: 다른 에이전트들의 초안을 [에이전트 초안]으로 받아 하나로 정한다 — md 의 'final: on'
 
     @property
     def label(self) -> str:
         text = f"{self.name} — {self.description}" if self.description else self.name
-        return text if self.memo else f"{text} (메모 안 받음)"
+        notes = (["다른 초안을 받아 하나로"] if self.final else []) + ([] if self.memo else ["메모 안 받음"])
+        return f"{text} ({' · '.join(notes)})" if notes else text
 
 
 BUILTIN_AGENTS: list[DraftAgent] = [
@@ -418,6 +423,22 @@ BUILTIN_AGENTS: list[DraftAgent] = [
 - 찾은 문제는 파일 경로(가능하면 함수명)와 함께 무엇이 왜 문제인지 한 줄씩 적고, 고치라는 지시로 마무리한다.
 - 문제가 없으면 테스트나 확인 절차를 추가하라는 지시를 쓴다. 변경분이 없으면 마지막 응답을 바탕으로 검증을 요청한다.
 """),
+    DraftAgent(
+        id="final", name="최종 결정",
+        description="다른 에이전트들의 초안을 평가해 보낼 프롬프트 하나로 정한다",
+        context=("instruction", "last_message"),
+        final=True,  # 작성 에이전트들이 끝난 뒤 마지막에 한 번 실행된다
+        steps=("각 초안이 마지막 응답의 질문·대기 사유에 답하는지, 원래 지시와 사용자 메모에 맞는지 평가한다",
+               "초안끼리 충돌하는 지시를 찾아 어느 쪽을 택할지 정한다 (사용자 메모가 있으면 그 의도를 우선)",
+               "택한 내용을 중복 없이 하나의 지시로 합치고, 상황에 없는 파일·명령은 뺀다",
+               "에이전트가 바로 실행할 수 있는 순서로 다듬는다"),
+        instructions="""\
+역할: 여러 작성 에이전트의 초안을 읽고 에이전트에게 보낼 최종 프롬프트 하나를 결정하는 편집자.
+- '에이전트 초안'의 각 초안을 상황·원래 지시·사용자 메모에 비추어 평가하고, 가장 적절한 초안을 고르거나 좋은 부분만 합쳐 하나로 만든다.
+- 초안끼리 충돌하면 마지막 응답의 질문에 직접 답하는 쪽, 사용자 메모의 의도에 가까운 쪽을 택한다. 양쪽을 다 하라고 늘어놓지 않는다.
+- 결과는 가장 긴 초안보다 길지 않게 하고, 초안에 없는 새 작업은 더하지 않는다.
+- '에이전트 초안' 절이 없으면 상황과 메모로 직접 쓴다.
+"""),
 ]
 DEFAULT_AGENT = BUILTIN_AGENTS[0].id
 
@@ -435,6 +456,7 @@ def parse_agent_file(path: str) -> DraftAgent:
         context: diff, log               (선택, 기본 instruction, last_message)
         step: 바뀐 함수를 파악한다          (선택, 반복 가능 — 생각의 흐름 기본값. 옵션 > 에이전트 탭에서 덮어씀)
         memo: off                        (선택, 기본 on — off 면 사용자 메모를 요청에 넣지 않음)
+        final: on                        (선택, 기본 off — on 이면 최종 결정 에이전트: 다른 초안을 받아 하나로 정함)
         ---
         역할 지시문 본문…
 
@@ -472,14 +494,17 @@ def parse_agent_file(path: str) -> DraftAgent:
     bad = [c for c in ctx if c not in CONTEXT_PROVIDERS]
     if bad:
         raise ConfigError(f"{path}: 모르는 context — {', '.join(bad)} (가능: {', '.join(CONTEXT_PROVIDERS)})")
-    memo_raw = meta.get("memo", "on").strip().lower()
-    if memo_raw not in ("on", "off", "yes", "no", "true", "false", "1", "0"):
-        raise ConfigError(f"{path}: memo 는 on 또는 off — {memo_raw}")
+    flags = {}
+    for key, default in (("memo", "on"), ("final", "off")):
+        raw = meta.get(key, default).strip().lower()
+        if raw not in ("on", "off", "yes", "no", "true", "false", "1", "0"):
+            raise ConfigError(f"{path}: {key} 는 on 또는 off — {raw}")
+        flags[key] = raw in ("on", "yes", "true", "1")
     if not body.strip():
         raise ConfigError(f"{path}: 지시문 본문이 비어 있음")
     return DraftAgent(id=agent_id, name=name, description=meta.get("description", "").strip(),
                       instructions=body.strip() + "\n", context=ctx, builtin=False, path=path,
-                      steps=tuple(x for x in steps if x), memo=memo_raw in ("on", "yes", "true", "1"))
+                      steps=tuple(x for x in steps if x), memo=flags["memo"], final=flags["final"])
 
 
 def load_agents(config_path: str,
@@ -597,8 +622,9 @@ async def _repo_context(provider: str, repo_dir: str | None) -> list[str]:
 
 
 async def build_draft_request(agent: DraftAgent, row: Row, note: str, current: str,
-                              include_context: bool, repo_dir: str | None) -> str:
-    """에이전트가 고른 제공자로 요청 본문을 조립한다. include_context 가 꺼져 있으면 상태만 보낸다."""
+                              include_context: bool, repo_dir: str | None, drafts: str = "") -> str:
+    """에이전트가 고른 제공자로 요청 본문을 조립한다. include_context 가 꺼져 있으면 상태만 보낸다.
+    drafts 는 최종 결정 에이전트가 받는 다른 에이전트들의 초안(머리말 포함). 다듬기(current 있음)에는 넣지 않는다."""
     label = STATE_STYLE.get(row.state, (row.state or "?",))[0]
     lines = ["[에이전트 상황]",
              f"저장소/워크트리/브랜치: {row.repo} / {row.worktree} ({row.branch})",
@@ -616,6 +642,8 @@ async def build_draft_request(agent: DraftAgent, row: Row, note: str, current: s
                 lines += ["", "[마지막 응답]", _clip(row.last_message, 2000) or "-"]
             elif prov in ("goal", "diff", "log"):
                 lines += await _repo_context(prov, repo_dir)
+    if agent.final and drafts.strip() and not current.strip():  # 받을 초안이 없으면(단독 실행) 절을 넣지 않는다
+        lines += ["", "[에이전트 초안]", drafts.strip()]
     if agent.memo:  # 메모를 받지 않는 에이전트(goal)는 절 자체를 넣지 않는다
         lines += ["", "[사용자 메모]", note.strip() or "(없음 — 상황에 맞는 다음 지시를 제안)"]
     if current.strip():
@@ -673,9 +701,9 @@ def draft_system_prompt(agent: DraftAgent) -> str:
 
 
 async def draft_prompt(cfg: AIConfig, agent: DraftAgent, row: Row, note: str, current: str,
-                       cwd: str | None, repo_dir: str | None = None) -> str:
+                       cwd: str | None, repo_dir: str | None = None, drafts: str = "") -> str:
     """AI 로 프롬프트 초안을 만든다. 실패 시 DraftError."""
-    request = await build_draft_request(agent, row, note, current, cfg.include_context, repo_dir)
+    request = await build_draft_request(agent, row, note, current, cfg.include_context, repo_dir, drafts)
     system = draft_system_prompt(agent)
     if cfg.provider == "claude":
         cmd = ["claude", "-p", "--no-session-persistence", "--tools", "", "--output-format", "json",
@@ -744,17 +772,40 @@ def split_draft(text: str, agents: list[DraftAgent]) -> dict[str, str]:
     return {aid: "\n".join(lines).strip() for aid, lines in found.items()}
 
 
+def split_run(agents: list[DraftAgent]) -> tuple[list[DraftAgent], DraftAgent | None]:
+    """체크한 에이전트를 (작성 에이전트들, 최종 결정 에이전트) 로 나눈다. 결정 에이전트는 하나만 쓰며
+    여럿 체크했으면 마지막으로 체크한 것."""
+    writers = [a for a in agents if not a.final]
+    decider = next((a for a in reversed(agents) if a.final), None)
+    return writers, decider
+
+
+def run_order(agents: list[DraftAgent]) -> list[DraftAgent]:
+    """실제 실행 순서: 작성 에이전트들(체크 순서) 뒤에 최종 결정 에이전트."""
+    writers, decider = split_run(agents)
+    return writers + ([decider] if decider else [])
+
+
 async def draft_each(cfg: AIConfig, agents: list[DraftAgent], row: Row, note: str, currents: dict[str, str],
                      cwd: str | None, repo_dir: str | None = None, on_step=None) -> str:
-    """에이전트들이 각자 독립적으로(같은 상황·메모로) 초안을 쓰고, 순서대로 묶은 결과를 돌려준다.
-    currents 는 다듬기일 때 에이전트별 기존 초안. on_step(i, agent, combined_so_far) 는 단계마다 호출."""
+    """작성 에이전트들이 각자 독립적으로(같은 상황·메모로) 초안을 쓰고 순서대로 묶는다. 최종 결정 에이전트가
+    있으면 그 묶음을 [에이전트 초안]으로 받아 프롬프트 하나로 정하고, 그것이 결과가 된다.
+    currents 는 다듬기일 때 에이전트별 기존 초안. on_step(i, agent, text_so_far) 는 단계마다 호출."""
+    writers, decider = split_run(agents)
     parts: list[tuple[DraftAgent, str]] = []
-    for i, agent in enumerate(agents):
+    for i, agent in enumerate(writers):
         text = await draft_prompt(cfg, agent, row, note, currents.get(agent.id, ""), cwd, repo_dir)
         parts.append((agent, text))
         if on_step:
             on_step(i, agent, combine_drafts(parts))
-    return combine_drafts(parts)
+    if decider is None:
+        return combine_drafts(parts)
+    # 결정 에이전트에게는 하나뿐이어도 누가 썼는지 보이도록 머리말을 붙인다
+    drafts = "\n\n".join(f"{section_header(a)}\n{t.strip()}" for a, t in parts)
+    final = await draft_prompt(cfg, decider, row, note, currents.get(decider.id, ""), cwd, repo_dir, drafts=drafts)
+    if on_step:
+        on_step(len(writers), decider, final)
+    return final
 
 
 class PromptArea(TextArea):
@@ -857,8 +908,13 @@ class PromptScreen(ModalScreen[str | None]):
         return pick_agents(self.agents, self.agent_ids)
 
     def _order_text(self) -> str:
-        names = " → ".join(a.name + ("" if a.memo else "(메모 안 받음)") for a in self.chain)
-        return f"실행 순서: {names}" + ("  (각자 독립적으로 쓰고 이 순서로 묶음)" if len(self.chain) > 1 else "")
+        writers, decider = split_run(self.chain)
+        names = " → ".join(a.name + ("" if a.memo else "(메모 안 받음)") for a in writers)
+        if decider and writers:
+            return f"실행 순서: {names} ⇒ {decider.name}  (각자 쓴 초안을 {decider.name}이 하나로 정함)"
+        if decider:
+            return f"실행 순서: {decider.name}  (받을 초안이 없어 직접 작성)"
+        return f"실행 순서: {names}" + ("  (각자 독립적으로 쓰고 이 순서로 묶음)" if len(writers) > 1 else "")
 
     def on_selection_list_selected_changed(self, event: SelectionList.SelectedChanged) -> None:
         """체크 상태가 바뀌면 순서 목록을 맞춘다: 해제된 것은 빼고, 새로 체크된 것은 뒤에 붙인다."""
@@ -892,7 +948,7 @@ class PromptScreen(ModalScreen[str | None]):
         else:
             note, current, what = text, "", "초안 작성 중"              # 메모로 새 초안
             self.note = note
-        self._set_ai_status(self._progress_text(0, what))
+        self._set_ai_status(self._progress_text(self._run_agents(current), 0, what))
         self.draft_worker = self.run_worker(
             self._draft(note, current), group="draft", exclusive=True, exit_on_error=False,
         )
@@ -905,25 +961,37 @@ class PromptScreen(ModalScreen[str | None]):
             return True
         return difflib.SequenceMatcher(None, text, self.last_draft).ratio() >= 0.5
 
-    def _progress_text(self, step: int, what: str) -> str:
-        chain = self.chain
-        who = chain[step].name if len(chain) == 1 else f"{step + 1}/{len(chain)} {chain[step].name}"
+    def _run_agents(self, current: str) -> list[DraftAgent]:
+        """이번에 실제로 실행할 에이전트들. 다듬기인데 최종 결정 에이전트가 있으면 그것만 다시 돌린다
+        (결정된 프롬프트에는 머리말이 없어 작성 에이전트별로 나눌 수 없고, 결정 에이전트가 다듬는 것이 맞다)."""
+        writers, decider = split_run(self.chain)
+        if current.strip() and decider:
+            return [decider]
+        return run_order(self.chain)
+
+    def _progress_text(self, order: list[DraftAgent], step: int, what: str) -> str:
+        who = order[step].name if len(order) == 1 else f"{step + 1}/{len(order)} {order[step].name}"
         return f"AI {what}… ({who} · {self.ai.provider if self.ai else ''}, Esc 중단 · Ctrl+G 다시 시작)"
 
     async def _draft(self, note: str, current: str) -> str:
         assert self.ai is not None
-        chain = self.chain
-        currents = split_draft(current, chain) if current.strip() else {}
+        order = self._run_agents(current)
+        if not current.strip():
+            currents = {}
+        elif len(order) == 1 and order[0].final:
+            currents = {order[0].id: current}
+        else:
+            currents = split_draft(current, order)
 
         def on_step(i: int, agent: DraftAgent, combined: str) -> None:
             # 끝난 에이전트의 초안을 바로 보여 주고 다음 단계 진행을 표시한다 (워커는 같은 이벤트 루프에서 돈다)
             area = self.query_one(TextArea)
             area.load_text(combined)
             area.move_cursor(area.document.end)
-            if i + 1 < len(chain):
-                self._set_ai_status(self._progress_text(i + 1, "작성 중"))
+            if i + 1 < len(order):
+                self._set_ai_status(self._progress_text(order, i + 1, "작성 중"))
 
-        return await draft_each(self.ai, chain, self.row, note, currents, self.cwd, self.repo_dir, on_step)
+        return await draft_each(self.ai, order, self.row, note, currents, self.cwd, self.repo_dir, on_step)
 
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
         if event.worker.group != "draft" or event.worker is not self.draft_worker:
@@ -934,7 +1002,9 @@ class PromptScreen(ModalScreen[str | None]):
             area.load_text(draft)
             area.move_cursor(area.document.end)
             self.last_draft = draft
-            names = " → ".join(a.name for a in self.chain)
+            writers, decider = split_run(self.chain)
+            names = " → ".join(a.name for a in writers) + (f" ⇒ {decider.name}" if decider and writers
+                                                           else decider.name if decider else "")
             self._set_ai_status(f"AI 초안({names})을 넣었습니다. 수정 후 Enter 로 전송 · Ctrl+G 로 다듬기")
         elif event.state == WorkerState.ERROR:
             err = event.worker.error
@@ -1400,7 +1470,8 @@ class SettingsScreen(ModalScreen[Settings | None]):
     def _agent_desc(self, a: DraftAgent) -> str:
         where = "내장" if a.builtin else f"파일 {a.path}"
         return (f"{a.description or '-'}  ·  {where}  ·  컨텍스트: {', '.join(a.context)}"
-                + ("" if a.memo else "  ·  사용자 메모: 받지 않음"))
+                + ("" if a.memo else "  ·  사용자 메모: 받지 않음")
+                + ("  ·  최종 결정: 다른 에이전트들의 초안을 받아 하나로 정함" if a.final else ""))
 
     def _step_rows(self, steps: list[str]) -> list:
         """단계 편집 행 위젯들. compose 와 mount 양쪽에서 쓰므로 컨텍스트 매니저 대신 직접 만든다."""
