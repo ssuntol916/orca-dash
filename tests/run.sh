@@ -4,6 +4,6 @@ set -e
 ROOT="${0:A:h:h}"
 PY="$ROOT/.venv/bin/python"; [[ -x "$PY" ]] || PY=python3
 cd "$ROOT"
-for t in tests/test_settings.py tests/test_agents.py tests/test_steps.py tests/test_final.py; do
+for t in tests/test_settings.py tests/test_agents.py tests/test_steps.py tests/test_final.py tests/test_autosend.py; do
   echo "== $t"; "$PY" "$t" 2>&1 | tail -1
 done
