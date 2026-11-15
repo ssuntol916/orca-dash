@@ -54,6 +54,10 @@ final: off                  # on 이면 최종 결정 에이전트로 동작: �
 - 기존 테스트 파일과 같은 방식·위치를 따르게 한다.
 ```
 
+## 테스트
+
+`tests/run.sh` 가 헤드리스 테스트 네 벌(설정·CLI, 작성 에이전트 등록과 컨텍스트, 생각의 흐름 편집 탭, 최종 결정 경로)을 저장소의 `.venv` 로 차례로 실행합니다. 각 파일은 단독으로도 `python tests/test_agents.py` 처럼 실행할 수 있고, Textual `run_test` 로 실제 화면 흐름까지 확인합니다. 표 표시용 입력은 `tests/fixtures/sample.json` 의 익명화한 `orca worktree ps --json` 출력입니다.
+
 ## 커밋 메시지 훅 활성화
 
 이 저장소는 `.githooks/commit-msg`로 커밋 메시지 규격(`<type>(<scope>): <한국어 명사구>` 제목과 `- `로 시작하는 본문 bullet 2개 이상)을 검사합니다. 훅은 저장소 안에 들어 있지만 git은 기본적으로 `.git/hooks`만 보므로, 새로 clone한 뒤에는 저장소 루트에서 `git config core.hooksPath .githooks`를 한 번 실행해야 훅이 동작합니다. 규격 전체는 훅 파일 머리의 주석에 있고, 규격에 맞지 않는 메시지는 커밋이 거절되며 이유와 예시가 함께 출력됩니다.

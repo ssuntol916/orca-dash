@@ -1,0 +1,272 @@
+{
+ "id": "demo",
+ "ok": true,
+ "result": {
+  "worktrees": [
+   {
+    "workspaceKind": "git",
+    "worktreeId": "id1::/tmp/demo/repo1",
+    "repoId": "598ffef2-e214-4daa-b501-da96052ee846",
+    "hostId": "local",
+    "identity": {
+     "key": "wt2:local:2d5e6a9d-7fe6-4e68-a2a4-9ef1990f6450",
+     "executionHostId": "local",
+     "instanceId": "2d5e6a9d-7fe6-4e68-a2a4-9ef1990f6450"
+    },
+    "terminalPlatform": "darwin",
+    "repo": "repo1",
+    "path": "/tmp/demo/repo1",
+    "branch": "refs/heads/main",
+    "isArchived": false,
+    "isMainWorktree": true,
+    "hasHostSidebarActivity": true,
+    "defaultBranch": true,
+    "worktreeInstanceId": "2d5e6a9d-7fe6-4e68-a2a4-9ef1990f6450",
+    "parentWorktreeId": null,
+    "childWorktreeIds": [],
+    "workspaceLineage": null,
+    "displayName": "wt1",
+    "workspaceStatus": "in-progress",
+    "sortOrder": 1794703325620,
+    "lastActivityAt": 1794702950586,
+    "linkedIssue": null,
+    "linkedPR": null,
+    "linkedLinearIssue": null,
+    "linkedGitLabMR": null,
+    "linkedGitLabIssue": null,
+    "linkedItems": [],
+    "comment": "",
+    "isPinned": false,
+    "isActive": false,
+    "unread": false,
+    "liveTerminalCount": 2,
+    "hasAttachedPty": true,
+    "unverifiableTerminalCount": 0,
+    "lastOutputAt": 1794703736178,
+    "preview": "데모 preview 1",
+    "status": "working",
+    "agents": [
+     {
+      "paneKey": "4d8be3a5-69b2-445c-b1aa-459c800403e7:4eba77e9-271d-4618-9d61-830b30c3a8ba",
+      "parentPaneKey": null,
+      "state": "working",
+      "agentType": "claude",
+      "prompt": "데모 prompt 1",
+      "taskTitle": null,
+      "displayName": null,
+      "conversationName": "orca-dash.sh 새로고침 시 스크롤 위치",
+      "lastAssistantMessage": "데모 lastAssistantMessage 1",
+      "toolName": "Bash",
+      "toolInput": "데모 toolInput 1",
+      "interrupted": false,
+      "mainAgent": {
+       "state": "working",
+       "stateStartedAt": 1794703353433
+      },
+      "stateStartedAt": 1794703353434,
+      "updatedAt": 1794703735300,
+      "hasLivePty": true,
+      "programStatus": {
+       "state": "working",
+       "message": "Recreate sample.json from live Orca output and run test_settings",
+       "observedAt": 1794703736015
+      },
+      "activity": {
+       "listed": true,
+       "status": "working",
+       "unread": false,
+       "clearable": false,
+       "sortAt": 1794703353434,
+       "title": "데모 title 1"
+      }
+     }
+    ],
+    "sidebarStatus": "working",
+    "terminalVerdict": "live",
+    "environment": {
+     "id": "local",
+     "name": "local"
+    },
+    "parent": null,
+    "address": {
+     "environment": "local",
+     "worktree": "identity:wt2:local:2d5e6a9d-7fe6-4e68-a2a4-9ef1990f6450",
+     "line": "--environment local --worktree identity:wt2:local:2d5e6a9d-7fe6-4e68-a2a4-9ef1990f6450"
+    }
+   },
+   {
+    "workspaceKind": "git",
+    "worktreeId": "id2::/tmp/demo/repo2",
+    "repoId": "f08c049d-9dc8-432d-a140-1519c4945b5a",
+    "hostId": "local",
+    "terminalPlatform": "darwin",
+    "repo": "repo2",
+    "path": "/tmp/demo/repo2",
+    "branch": "",
+    "isArchived": false,
+    "isMainWorktree": true,
+    "hasHostSidebarActivity": true,
+    "defaultBranch": false,
+    "worktreeInstanceId": "10d55a3c-9678-4703-89f4-0dfdfd7d2136",
+    "parentWorktreeId": null,
+    "childWorktreeIds": [],
+    "workspaceLineage": null,
+    "displayName": "wt2",
+    "workspaceStatus": "in-progress",
+    "sortOrder": 1794702954546,
+    "lastActivityAt": 1794702900768,
+    "linkedIssue": null,
+    "linkedPR": null,
+    "linkedLinearIssue": null,
+    "linkedGitLabMR": null,
+    "linkedGitLabIssue": null,
+    "linkedItems": [],
+    "comment": "",
+    "isPinned": false,
+    "isActive": false,
+    "unread": false,
+    "liveTerminalCount": 2,
+    "hasAttachedPty": true,
+    "unverifiableTerminalCount": 0,
+    "lastOutputAt": 1794703736095,
+    "preview": "데모 preview 2",
+    "status": "working",
+    "agents": [
+     {
+      "paneKey": "c92962a2-c2d4-4f36-9148-400b31b50a34:6335191c-4346-49eb-9fd6-b76a0c371a07",
+      "parentPaneKey": null,
+      "state": "working",
+      "agentType": "claude",
+      "prompt": "데모 prompt 2",
+      "taskTitle": null,
+      "displayName": null,
+      "conversationName": "개발 진행 현황 보고",
+      "lastAssistantMessage": null,
+      "toolName": "Write",
+      "toolInput": "데모 toolInput 2",
+      "interrupted": false,
+      "mainAgent": {
+       "state": "working",
+       "stateStartedAt": 1794703057552
+      },
+      "stateStartedAt": 1794703057535,
+      "updatedAt": 1794703710444,
+      "hasLivePty": true,
+      "programStatus": {
+       "state": "working",
+       "message": "Writing src/residue_cleaner/junk_rules.py",
+       "observedAt": 1794703710298
+      },
+      "activity": {
+       "listed": true,
+       "status": "working",
+       "unread": false,
+       "clearable": false,
+       "sortAt": 1794703057535,
+       "title": "데모 title 2"
+      }
+     }
+    ],
+    "sidebarStatus": "working",
+    "terminalVerdict": "live",
+    "environment": {
+     "id": "local",
+     "name": "local"
+    },
+    "parent": null,
+    "address": {
+     "environment": "local",
+     "worktree": "id:f08c049d-9dc8-432d-a140-1519c4945b5a::/tmp/demo/repo2",
+     "line": "--environment local --worktree id:f08c049d-9dc8-432d-a140-1519c4945b5a::/tmp/demo/repo2"
+    }
+   },
+   {
+    "workspaceKind": "git",
+    "worktreeId": "id3::/tmp/demo/repo3",
+    "repoId": "e8e4e880-e88f-43b1-ae36-47915f8be5ba",
+    "hostId": "local",
+    "identity": {
+     "key": "wt2:local:70f9e9dc-0269-41c8-a800-8f819c92f91e",
+     "executionHostId": "local",
+     "instanceId": "70f9e9dc-0269-41c8-a800-8f819c92f91e"
+    },
+    "terminalPlatform": "darwin",
+    "repo": "repo3",
+    "path": "/tmp/demo/repo3",
+    "branch": "refs/heads/ssuntol916/tasks-todo",
+    "isArchived": false,
+    "isMainWorktree": false,
+    "hasHostSidebarActivity": false,
+    "defaultBranch": false,
+    "cliCreated": true,
+    "worktreeInstanceId": "70f9e9dc-0269-41c8-a800-8f819c92f91e",
+    "lineageWorktreeInstanceId": "70f9e9dc-0269-41c8-a800-8f819c92f91e",
+    "parentWorktreeInstanceId": "65866c6d-9c42-462d-a1ed-7d7cdb106f00",
+    "parentWorktreeId": "e8e4e880-e88f-43b1-ae36-47915f8be5ba::/tmp/demo/repo3",
+    "childWorktreeIds": [],
+    "workspaceLineage": null,
+    "displayName": "wt3",
+    "workspaceStatus": "todo",
+    "sortOrder": 1794213456442,
+    "lastActivityAt": 1793784629351,
+    "createdAt": 1792899327485,
+    "creatorProvenance": {
+     "kind": "host"
+    },
+    "linkedIssue": null,
+    "linkedPR": null,
+    "linkedLinearIssue": null,
+    "linkedGitLabMR": null,
+    "linkedGitLabIssue": null,
+    "linkedItems": [],
+    "comment": "데모 comment 3",
+    "isPinned": false,
+    "isActive": false,
+    "unread": false,
+    "liveTerminalCount": 0,
+    "hasAttachedPty": false,
+    "unverifiableTerminalCount": 0,
+    "lastOutputAt": null,
+    "preview": "",
+    "status": "inactive",
+    "agents": [],
+    "sidebarStatus": "inactive",
+    "terminalVerdict": "none",
+    "environment": {
+     "id": "local",
+     "name": "local"
+    },
+    "parent": {
+     "state": "known",
+     "selector": "id:e8e4e880-e88f-43b1-ae36-47915f8be5ba::/tmp/demo/repo3",
+     "environment": {
+      "id": "local",
+      "name": "local"
+     },
+     "address": {
+      "environment": "local",
+      "worktree": "identity:wt2:local:65866c6d-9c42-462d-a1ed-7d7cdb106f00",
+      "line": "--environment local --worktree identity:wt2:local:65866c6d-9c42-462d-a1ed-7d7cdb106f00"
+     }
+    },
+    "address": {
+     "environment": "local",
+     "worktree": "identity:wt2:local:70f9e9dc-0269-41c8-a800-8f819c92f91e",
+     "line": "--environment local --worktree identity:wt2:local:70f9e9dc-0269-41c8-a800-8f819c92f91e"
+    }
+   }
+  ],
+  "hostScope": {
+   "hostIds": [
+    "local"
+   ],
+   "omittedHostIds": [],
+   "omittedHostSelectors": []
+  },
+  "totalCount": 3,
+  "truncated": false
+ },
+ "_meta": {
+  "runtimeId": "demo"
+ }
+}
