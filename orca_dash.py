@@ -15,6 +15,8 @@ Orca 1.4.230 출력 구조 기준으로 작성.
              최종 결정을 함께 체크하면 그 묶음을 받아 프롬프트 하나로 정한다. ~/.config/orca-dash/agents/<id>.md 로 추가 가능
   o          옵션 보기/수정 (조회 간격·소스·AI). 저장하면 설정 파일에 쓰고 바로 적용.
              「에이전트」 탭에서 작성 에이전트별 '생각의 흐름'(답을 쓰기 전에 거치는 생각 단계)을 +/- 로 편집
+             「자동 전송」 탭에서 자동 전송 정책(켬/끔 · 허용 상태·대기 사유 · 연속 상한 · 최소 간격 · 저장소별 켬/끔 ·
+             최종 결정 에이전트 필수)을 편집. 기본은 꺼짐이고 --auto-send on|off 로 이번 실행만 바꿀 수 있다
   r 새로고침 · f 필터 · e 빈 워크트리 · q 종료
   macOS 에서는 메인 화면이 앞에 있을 때 입력 소스를 영문(ABC)으로 자동 전환하고, 프롬프트·옵션 창을
   열거나 다른 앱으로 가거나 종료하면 원래 입력 소스로 되돌린다 (옵션에서 끌 수 있음). 메인 화면에서 Caps Lock·
@@ -23,12 +25,18 @@ Orca 1.4.230 출력 구조 기준으로 작성.
 
 설정 파일: ~/.config/orca-dash/config.json (--config 로 변경). 명령줄 인자가 있으면 그 값이 우선.
 
+자동 전송 정책: 사람 없이 초안을 보내도 되는지는 auto_send_allowed(settings, row, history) 가 (허용 여부, 한국어 사유)
+로 판정한다. 순서대로 켬/끔(저장소별 설정이 전체 설정보다 우선) → 에이전트 터미널 → 허용 상태(기본 입력 대기) →
+허용 대기 사유(기본 질문) → 최종 결정 에이전트 → 연속 자동 전송 상한(기본 3회, 사람이 직접 보내면 0으로) →
+마지막 전송 뒤 최소 간격(기본 120초)을 본다. 권한 대기와 막힘은 설정과 무관하게 항상 사람에게 남긴다.
+
 사용:
   python3 orca_dash.py                         # 로컬, 60초 간격
   python3 orca_dash.py --interval 30
   python3 orca_dash.py --ssh macmini-1         # 원격: ssh 로 원격 orca 실행 (미검증)
   python3 orca_dash.py --env <서버명>          # 원격: 페어링 서버 (미검증)
   python3 orca_dash.py --file sample.json      # 저장된 JSON 으로 화면 확인
+  python3 orca_dash.py --auto-send on          # 이번 실행만 자동 전송 정책 켬 (조건은 옵션의 「자동 전송」 탭)
 """
 from __future__ import annotations
 
@@ -58,7 +66,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import (Button, Checkbox, DataTable, Footer, Header, Input, Label, Select, SelectionList,
-                             Static, TabbedContent, TabPane, TextArea)
+                             Static, Switch, TabbedContent, TabPane, TextArea)
 from textual.worker import Worker, WorkerState
 
 # 상태 표시: (라벨, 색, 정렬 우선순위 — 작을수록 위)
@@ -1097,9 +1105,20 @@ class Settings:
     ai_agents: list[str] = field(default_factory=lambda: [DEFAULT_AGENT])  # 작성 에이전트 id 들, 실행 순서 (마지막에 쓴 것으로 갱신)
     agent_steps: dict[str, list[str]] = field(default_factory=dict)  # 에이전트별 생각의 흐름 (없는 id 는 에이전트 기본값)
     auto_abc: bool = True                           # macOS: 메인 화면에서 입력 소스를 영문으로 자동 전환
+    # 자동 전송 정책 (auto_send_allowed 가 읽는다). 기본은 꺼짐이고, 없는 필드는 이 기본값으로 읽힌다.
+    auto_send: bool = False                         # 전체 켬/끔
+    auto_send_states: list[str] = field(default_factory=lambda: list(AUTO_SEND_DEFAULT_STATES))  # 허용 상태
+    auto_send_waits: list[str] = field(default_factory=lambda: list(AUTO_SEND_DEFAULT_WAITS))    # 허용 대기 사유
+    auto_send_max_streak: int = 3                   # 사람 개입 없이 연속으로 보내는 상한(회)
+    auto_send_cooldown: int = 120                   # 같은 행의 마지막 전송 뒤 최소 간격(초)
+    auto_send_repos: dict[str, bool] = field(default_factory=dict)  # 저장소 이름별 켬/끔 (없으면 전체 설정)
+    auto_send_require_final: bool = True            # 작성 에이전트에 최종 결정 에이전트가 있어야 함
 
     FIELDS = ("interval", "orca", "local", "env", "host", "ssh",
               "ai", "ai_model", "ai_timeout", "ai_context", "ai_agents", "agent_steps", "auto_abc")
+    AUTO_SEND_FIELDS = ("auto_send", "auto_send_states", "auto_send_waits", "auto_send_max_streak",
+                        "auto_send_cooldown", "auto_send_repos", "auto_send_require_final")
+    FIELDS = FIELDS + AUTO_SEND_FIELDS
 
     @classmethod
     def load(cls, path: str) -> "Settings":
@@ -1171,9 +1190,48 @@ class Settings:
                                          if str(x).strip()]
                                 for k, v in self.agent_steps.items() if str(k).strip()}
         self.auto_abc = bool(self.auto_abc)
+        self._validate_auto_send(errs)
         if not self.local and not (self.env or self.host or self.ssh):
             errs.append("조회할 소스가 없음 (로컬을 끄면 env/host/ssh 중 하나 필요)")
         return errs
+
+    def _validate_auto_send(self, errs: list[str]) -> None:
+        """auto_send_* 필드의 타입을 맞춘다. 화면에서 온 문자열(공백 구분 목록, "repo:on repo2:off")도 받는다."""
+        for key, label in (("auto_send", "자동 전송"), ("auto_send_require_final", "최종 결정 필수")):
+            b = _as_bool(getattr(self, key))
+            if b is None:
+                errs.append(f"{label}은 on 또는 off")
+                b = type(self)().__dict__[key]
+            setattr(self, key, b)
+        for key, default in (("auto_send_states", AUTO_SEND_DEFAULT_STATES),
+                             ("auto_send_waits", AUTO_SEND_DEFAULT_WAITS)):
+            v = getattr(self, key)
+            if isinstance(v, str):
+                v = _split_list(v)
+            if not isinstance(v, (list, tuple)):
+                errs.append(f"{key} 는 문자열 목록")
+                v = []
+            setattr(self, key, list(dict.fromkeys(str(x).strip() for x in v if str(x).strip())) or list(default))
+        bad = [x for x in self.auto_send_states if auto_state(x) in AUTO_SEND_NEVER_STATES]
+        if bad:
+            errs.append(f"자동 전송 허용 상태에 {', '.join(bad)} 은 넣을 수 없음 (권한 대기·막힘은 항상 사람에게 남김)")
+        bad = [x for x in self.auto_send_waits if x in AUTO_SEND_NEVER_WAITS]
+        if bad:
+            errs.append(f"자동 전송 허용 대기 사유에 {', '.join(bad)} 은 넣을 수 없음 (권한 요청은 항상 사람이 답함)")
+        for key, label, low in (("auto_send_max_streak", "연속 자동 전송 상한은 1 이상의 정수(회)", 1),
+                                ("auto_send_cooldown", "자동 전송 최소 간격은 0 이상의 정수(초)", 0)):
+            try:
+                n = int(getattr(self, key))
+                if n < low:
+                    raise ValueError
+                setattr(self, key, n)
+            except (TypeError, ValueError):
+                errs.append(label)
+        try:
+            self.auto_send_repos = parse_repo_flags(self.auto_send_repos)
+        except ValueError as e:
+            errs.append(f"저장소별 자동 전송: {e}")
+            self.auto_send_repos = {}
 
     def apply_args(self, args: argparse.Namespace) -> list[str]:
         """명령줄에서 준 값으로 덮어쓰고, 덮어쓴 항목 이름을 돌려준다."""
@@ -1191,6 +1249,9 @@ class Settings:
         if args.ai_context is not None:
             self.ai_context = args.ai_context == "on"
             over.append("ai_context")
+        if getattr(args, "auto_send", None) is not None:
+            self.auto_send = args.auto_send == "on"
+            over.append("auto_send")
         return over
 
     def sources(self) -> list[Source]:
@@ -1204,6 +1265,156 @@ class Settings:
 
     def ai_config(self) -> AIConfig:
         return AIConfig.from_args(self.ai, self.ai_model or None, self.ai_timeout, self.ai_context)
+
+
+# ---------------------------------------------------------------------------
+# 자동 전송 정책: 사람이 빠진 자리에서 "어떤 조건에서 스스로 보내도 되는가"를 판정한다 (GOAL.md 「자동 전송 정책」).
+# 전송하는 쪽은 auto_send_allowed 만 부르면 된다. 이 절은 판정만 하고 전송·기록은 하지 않는다.
+# ---------------------------------------------------------------------------
+AUTO_SEND_DEFAULT_STATES = ("waiting_input",)
+AUTO_SEND_DEFAULT_WAITS = ("질문",)
+AUTO_SEND_NEVER_STATES = ("permission", "blocked")  # 설정과 무관하게 항상 사람에게 남기는 상태
+AUTO_SEND_NEVER_WAITS = ("권한",)                    # 설정과 무관하게 항상 사람이 답하는 대기 사유
+_AUTO_STATE_ALIAS = {"waiting": "waiting_input"}     # Orca 판에 따라 입력 대기가 waiting 또는 waiting_input 으로 온다
+_WAIT_KINDS = (  # (분류, 대기 사유 글에서 찾는 패턴) — 위에서부터 먼저 맞는 것
+    ("권한", r"권한|승인|허용|permission|approv"),
+    ("중단", r"중단|interrupt"),
+    ("질문", r"질문|입력|답|question|input|answer"),
+)
+
+
+def _as_bool(value) -> bool | None:
+    """bool 또는 on/off 류 문자열을 bool 로. 알 수 없으면 None ("off" 를 참으로 읽지 않기 위함)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in ("on", "true", "yes", "1"):
+        return True
+    if text in ("off", "false", "no", "0"):
+        return False
+    return None
+
+
+def parse_repo_flags(value) -> dict[str, bool]:
+    """저장소별 켬/끔. dict 또는 "repo:on repo2:off"(공백·쉼표 구분) 문자열을 받는다. 잘못되면 ValueError."""
+    if value in (None, ""):
+        return {}
+    if isinstance(value, str):
+        pairs = []
+        for tok in _split_list(value):
+            name, sep, flag = tok.rpartition(":")
+            if not sep or not name:
+                raise ValueError(f"'{tok}' 는 저장소:on 또는 저장소:off 형식이 아님")
+            pairs.append((name, flag))
+    elif isinstance(value, dict):
+        pairs = list(value.items())
+    else:
+        raise ValueError("{저장소 이름: true/false} 형태가 아님")
+    out: dict[str, bool] = {}
+    for name, flag in pairs:
+        b = _as_bool(flag)
+        if b is None or not str(name).strip():
+            raise ValueError(f"'{name}:{flag}' 의 값은 on 또는 off")
+        out[str(name).strip()] = b
+    return out
+
+
+def format_repo_flags(repos: dict[str, bool]) -> str:
+    return " ".join(f"{k}:{'on' if v else 'off'}" for k, v in (repos or {}).items())
+
+
+def auto_state(state) -> str:
+    """정책 비교용 상태 이름. waiting 과 waiting_input 을 같은 것으로 본다."""
+    s = str(state or "").strip().lower()
+    return _AUTO_STATE_ALIAS.get(s, s)
+
+
+def wait_kind(row) -> str:
+    """행의 대기 사유를 정책 분류(권한·중단·질문·없음)로 바꾼다. 어느 분류에도 안 맞으면 대기 사유 글 그대로.
+    사유가 비어 있는 입력 대기는 에이전트가 턴을 끝내고 답을 기다리는 것이므로 '질문'으로 본다."""
+    text = str(getattr(row, "wait", "") or "").strip()
+    if auto_state(getattr(row, "state", None)) == "permission":
+        return "권한"
+    for kind, pattern in _WAIT_KINDS:
+        if re.search(pattern, text, re.IGNORECASE):
+            return kind
+    if text:
+        return text
+    return "질문" if auto_state(getattr(row, "state", None)) == "waiting_input" else "없음"
+
+
+def _history_newest_first(history) -> list[dict]:
+    items = [h for h in (history or []) if isinstance(h, dict)]
+    def at(h: dict) -> float:
+        try:
+            return float(h.get("at") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    return sorted(items, key=at, reverse=True)
+
+
+def auto_send_streak(history) -> int:
+    """가장 최근 전송부터 거슬러 올라가며 "auto" 가 참인 항목이 이어지는 수. 사람이 직접 보낸 기록에서 끊긴다."""
+    n = 0
+    for h in _history_newest_first(history):
+        if not h.get("auto"):
+            break
+        n += 1
+    return n
+
+
+def has_final_agent(settings, agents: list[DraftAgent] | None = None) -> bool:
+    """설정의 작성 에이전트(ai_agents)에 최종 결정 성격의 에이전트가 있는지. agents(load_agents 결과)를 주면
+    사용자 정의 'final: on' 까지 보고, 없으면 내장 에이전트의 final 표시와 id "final" 로 판단한다."""
+    final_ids = {a.id for a in (agents if agents is not None else BUILTIN_AGENTS) if a.final}
+    if agents is None:
+        final_ids.add("final")
+    return any(i in final_ids for i in (settings.ai_agents or []))
+
+
+def auto_send_allowed(settings, row, history, *, now: float | None = None,
+                      agents: list[DraftAgent] | None = None) -> tuple[bool, str]:
+    """이 행에 지금 사람 없이 초안을 보내도 되는지. (허용 여부, 한국어 사유)를 돌려준다.
+
+    history 는 그 행의 최근 전송 기록(list[dict], 각 항목에 "at" epoch 초 · "text" · "auto")이고 순서는 가리지 않는다.
+    검사 순서: 켬/끔(저장소별 설정이 전체 설정보다 우선) → 에이전트 터미널 → 허용 상태 → 허용 대기 사유 →
+    최종 결정 에이전트 → 연속 상한 → 최소 간격. now·agents 는 시험과 사용자 정의 최종 결정 에이전트용 선택 인자.
+    """
+    repo = str(getattr(row, "repo", "") or "")
+    repos = settings.auto_send_repos or {}
+    if repo in repos:
+        if not repos[repo]:
+            return False, f"저장소 {repo} 는 꺼짐"
+    elif not settings.auto_send:
+        return False, "자동 전송 꺼짐"
+    if not getattr(row, "pane_key", None):
+        return False, "에이전트 터미널 없음"
+    state = auto_state(row.state)
+    if state in AUTO_SEND_NEVER_STATES or state not in {auto_state(x) for x in settings.auto_send_states}:
+        return False, f"상태 {row.state or '없음'} 은 허용 안 됨"
+    kind = wait_kind(row)
+    waits = list(settings.auto_send_waits or [])
+    if kind in AUTO_SEND_NEVER_WAITS or not (kind in waits or str(row.wait or "").strip() in waits):
+        return False, f"대기 사유 {kind} 은 허용 안 됨"
+    if settings.auto_send_require_final and not has_final_agent(settings, agents):
+        return False, "작성 에이전트에 최종 결정 에이전트 없음"
+    limit = int(settings.auto_send_max_streak)
+    streak = auto_send_streak(history)
+    if streak >= limit:
+        return False, f"연속 {limit}회 상한"
+    recent = _history_newest_first(history)
+    cooldown = int(settings.auto_send_cooldown)
+    if recent and cooldown > 0:
+        try:
+            last = float(recent[0].get("at") or 0)
+        except (TypeError, ValueError):
+            last = 0.0
+        elapsed = max(0.0, (time.time() if now is None else now) - last)
+        if elapsed < cooldown:
+            return False, f"마지막 전송 후 {int(elapsed)}초 ({cooldown}초 미만)"
+    return True, f"허용 (연속 {streak}/{limit}회)"
 
 
 class InputSource:
@@ -1379,7 +1590,7 @@ class SettingsScreen(ModalScreen[Settings | None]):
     SettingsScreen #path, SettingsScreen #override { color: $text-muted; height: auto; }
     SettingsScreen TabbedContent, SettingsScreen ContentSwitcher, SettingsScreen TabPane { height: 1fr; }
     SettingsScreen TabPane { padding: 0; }
-    SettingsScreen #form, SettingsScreen #agent-form { height: 1fr; }
+    SettingsScreen #form, SettingsScreen #agent-form, SettingsScreen #auto-form { height: 1fr; }
     SettingsScreen #agent-desc, SettingsScreen #agent-role { color: $text-muted; height: auto; margin-left: 20; }
     SettingsScreen #agent-role { max-height: 6; overflow-y: auto; }
     SettingsScreen #steps { height: auto; }
@@ -1438,6 +1649,8 @@ class SettingsScreen(ModalScreen[Settings | None]):
                     yield from self._compose_general(s, row)
                 with TabPane("에이전트", id="tab-agents"):
                     yield from self._compose_agents(row)
+                with TabPane("자동 전송", id="tab-auto"):
+                    yield from self._compose_auto(s, row)
             yield Label("", id="form-error")
             with Horizontal(id="buttons"):
                 yield Button("취소 (Esc)", id="cancel")
@@ -1483,6 +1696,36 @@ class SettingsScreen(ModalScreen[Settings | None]):
             with Horizontal(id="step-buttons"):
                 yield Button("+ 단계 추가", id="step-add")
                 yield Button("기본값으로", id="step-reset")
+
+    def _compose_auto(self, s: Settings, row) -> ComposeResult:
+        """자동 전송 정책 탭. 값은 _collect_auto 가 읽고 Settings.validate 가 검증한다."""
+        with VerticalScroll(id="auto-form"):
+            yield from row("자동 전송", Switch(s.auto_send, id="auto_send"))
+            yield Label("켜면 아래 조건을 모두 만족하는 행에만 사람 없이 초안을 보냄. 권한 대기·막힘은 항상 사람에게 남김",
+                        classes="hint")
+            yield from row("허용 상태", Input(" ".join(s.auto_send_states), id="auto_send_states",
+                                          placeholder="공백 구분 (기본 waiting_input = 입력 대기)"))
+            yield from row("허용 대기 사유", Input(" ".join(s.auto_send_waits), id="auto_send_waits",
+                                             placeholder="공백 구분: 질문 · 중단 · 없음 (기본 질문)"))
+            yield from row("연속 상한(회)", Input(str(s.auto_send_max_streak), type="integer", id="auto_send_max_streak"))
+            yield Label("사람 개입 없이 이어서 보낼 수 있는 횟수. 사람이 직접 한 번 보내면 다시 0부터", classes="hint")
+            yield from row("최소 간격(초)", Input(str(s.auto_send_cooldown), type="integer", id="auto_send_cooldown"))
+            yield from row("저장소별 켬/끔", Input(format_repo_flags(s.auto_send_repos), id="auto_send_repos",
+                                             placeholder="예: repo:on repo2:off (없는 저장소는 위 스위치를 따름)"))
+            yield from row("최종 결정 필수", Switch(s.auto_send_require_final, id="auto_send_require_final"))
+            yield Label("작성 에이전트에 최종 결정(final) 에이전트가 있을 때만 자동 전송", classes="hint")
+
+    def _collect_auto(self) -> dict:
+        q = self.query_one
+        return dict(
+            auto_send=q("#auto_send", Switch).value,
+            auto_send_states=q("#auto_send_states", Input).value,
+            auto_send_waits=q("#auto_send_waits", Input).value,
+            auto_send_max_streak=q("#auto_send_max_streak", Input).value,
+            auto_send_cooldown=q("#auto_send_cooldown", Input).value,
+            auto_send_repos=q("#auto_send_repos", Input).value,
+            auto_send_require_final=q("#auto_send_require_final", Switch).value,
+        )
 
     def _agent_desc(self, a: DraftAgent) -> str:
         where = "내장" if a.builtin else f"파일 {a.path}"
@@ -1548,6 +1791,7 @@ class SettingsScreen(ModalScreen[Settings | None]):
             ai_agents=q("#ai_agents", Input).value,
             agent_steps=self._collect_steps(),
             auto_abc=q("#auto_abc", Checkbox).value,
+            **self._collect_auto(),
         )
 
     def action_save(self) -> None:
@@ -1957,6 +2201,8 @@ def main() -> None:
     g.add_argument("--ai-agent", metavar="ID", action="append",
                    help=f"작성 에이전트 (반복하면 그 순서로 이어서 작성). 내장: {', '.join(a.id for a in BUILTIN_AGENTS)}. "
                         "<설정 디렉터리>/agents/<id>.md 로 추가 가능")
+    p.add_argument("--auto-send", choices=["on", "off"],
+                   help="자동 전송 정책 켬/끔 (기본 off). 허용 조건은 옵션의 「자동 전송」 탭에서 정한다")
     args = p.parse_args()
     try:
         settings = Settings.load(args.config)
