@@ -31,6 +31,7 @@ Orca 1.4.230 출력 구조 기준으로 작성.
              최종 결정 에이전트 필수)을 편집. 기본은 꺼짐이고 --auto-send on|off 로 이번 실행만 바꿀 수 있다
   a          자동 전송 일시 정지/재개. 설정의 auto_send 가 켜져 있으면 새로고침 때마다 정책이 허용하고
              준비된 제안이 있는 행 하나에 그 제안을 사람 없이 보낸다 (제안이 없으면 보내지 않음).
+             보내기 직전에 진행 판정을 거쳐 달성·막힘이면 보내지 않고 macOS 알림으로 사람을 부른다.
              사람이 보낸 것과 자동으로 보낸 것 모두 <설정 디렉터리>/send-log.jsonl 에 한 줄씩 기록한다
   r 새로고침 · f 필터 · e 빈 워크트리 · q 종료
   macOS 에서는 메인 화면이 앞에 있을 때 입력 소스를 영문(ABC)으로 자동 전환하고, 프롬프트·옵션 창을
@@ -2739,7 +2740,7 @@ class OrcaDash(App):
 
     async def _send_prompt(self, src: Source, row: Row, text: str, *, auto: bool = False,
                            policy: str = "사람이 직접 전송", agent_ids: list[str] = (),
-                           drafts: dict | None = None) -> bool:
+                           drafts: dict | None = None, head: str = "") -> bool:
         """사람(Enter)과 자동 전송이 함께 쓰는 전송 경로. 성공·실패 모두 send-log.jsonl 에 기록한다."""
         target = f"{row.repo}/{row.worktree}"
         kind = "자동 전송" if auto else "프롬프트 전송"
@@ -2757,7 +2758,7 @@ class OrcaDash(App):
                 result = f"{type(e).__name__}: {e}"
         finally:
             self._record_send(row, text, auto=auto, policy=policy, agent_ids=list(agent_ids),
-                              drafts=drafts, result=result)
+                              drafts=drafts, result=result, head=head)
         if result != "ok":
             self.notify(f"{target}: {result}", title=f"{kind} 실패", severity="error", timeout=10)
             return False
@@ -2785,11 +2786,13 @@ class OrcaDash(App):
                     pass
 
     def _record_send(self, row: Row, text: str, *, auto: bool, policy: str, agent_ids: list[str],
-                     drafts: dict | None, result: str) -> None:
+                     drafts: dict | None, result: str, head: str = "") -> None:
         now = time.time()
         rec = {"at": now, "row_key": row.key, "repo": row.repo, "worktree": row.worktree, "branch": row.branch,
                "state": row.state, "wait": row.wait, "agent_ids": agent_ids, "text": text, "auto": auto,
                "policy": policy, "result": result, "row_updated_at": row.updated_at}
+        if head:
+            rec["head"] = head   # is_stalled 의 '변경 없이 반복' 감지용 저장소 상태 값
         if drafts:
             rec["drafts"] = drafts
         if auto and result == "ok":
@@ -2880,9 +2883,27 @@ class OrcaDash(App):
         return None
 
     async def _auto_send(self, src: Source, row: Row, prop: Proposal, policy: str, agent_ids: list[str]) -> None:
+        """정책이 허용한 행에 실제로 보낸다. 보내기 전에 진행 판정(judge_progress)을 거쳐 달성·막힘이면 보내지 않고
+        사람에게 알리며, 그 사실도 전송 기록에 result 로 남긴다 (GOAL.md 「자동 전송 정책」 필수 조건)."""
         try:
+            repo_dir = self._repo_dir(row)
+            cdir = config_dir_of(self.config_path)
+            history = load_send_history(cdir, row.key)
+            head = await repo_head(repo_dir)
+            verdict = await judge_progress(self.ai, row, repo_dir, history,
+                                           agent=load_verdict_agent(self.config_path, self.settings.agent_steps, repo_dir))
+            self.set_verdict(row, verdict, alert=True)
+            if not verdict.failed and verdict.verdict != "continue":
+                why = f"진행 판정 {verdict.label}: {verdict.reason}"
+                self._auto_reasons[row.key] = f"보류 — {why}"
+                self._record_send(row, prop.text.strip(), auto=True, policy=policy, agent_ids=agent_ids,
+                                  drafts=getattr(prop, "drafts", None), result=f"보류: {why}", head=head)
+                self._tick_status()
+                return
+            if verdict.failed:
+                policy = f"{policy} · {verdict.reason}"   # 판정을 못 했으면 그 사실을 기록에 남기고 정책대로 보낸다
             await self._send_prompt(src, row, prop.text.strip(), auto=True, policy=policy, agent_ids=agent_ids,
-                                    drafts=getattr(prop, "drafts", None))
+                                    drafts=getattr(prop, "drafts", None), head=head)
         finally:
             self._auto_sending = False
 
