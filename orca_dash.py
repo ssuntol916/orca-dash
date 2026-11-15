@@ -13,6 +13,10 @@ Orca 1.4.230 출력 구조 기준으로 작성.
              문제 발견(review, git 변경분에서 문제를 찾음) · 최종 결정(final, 다른 초안들을 받아 하나로 정함).
              여러 개를 체크하면 각자 독립적으로 초안을 쓰고 체크한 순서로 '[이름]' 머리말을 붙여 묶으며,
              최종 결정을 함께 체크하면 그 묶음을 받아 프롬프트 하나로 정한다. ~/.config/orca-dash/agents/<id>.md 로 추가 가능
+             하고, 저장소 안 .orca-dash/agents/<id>.md 가 있으면 그 저장소의 에이전트에 한해 같은 id 를 덮어쓴다.
+             문제 발견·최종 결정은 읽기 전용 도구(Read·Grep·Glob)로 저장소 파일을 직접 읽고 쓴다 (claude: --tools 로
+             그 도구만 남기고 권한이 필요한 것은 묻지 않고 거절, codex: 원래 읽기 전용 샌드박스). md frontmatter 의
+             tools · model · timeout 으로 에이전트별 도구·모델·제한 시간을 정하며 쓰기·실행 도구는 거절한다
              옵션의 「백그라운드 제안」을 켜면 입력 대기·권한 대기·막힘 행이 생기거나 바뀔 때 창을 열지 않아도 뒤에서
              작성 에이전트 체인이 (메모 없이) 한 번에 하나씩 돌아 제안을 준비한다. 상태 열에 '제안 …'(작성 중) ·
              '제안 ✓'(준비됨) · '제안 ✗'(실패)로 보이고, 프롬프트 창을 열면 입력창에 들어와 있어 Enter 만 누르면 된다
@@ -385,14 +389,20 @@ CONTEXT_PROVIDERS = {
     "log": "최근 커밋 10개 (git log)",
 }
 GOAL_FILES = ("GOAL.md", "docs/GOAL.md", ".orca-dash/goal.md")
+# 작성 에이전트에게 줄 수 있는 도구. 저장소를 읽기만 하는 것으로 한정한다 — 초안이 사람 검토 없이 전송될 수 있으므로
+# 쓰기·실행 도구(Edit, Write, Bash 등)는 정의 단계(md)와 명령줄 조립 단계 양쪽에서 ConfigError 로 거절한다.
+READ_TOOLS = ("Read", "Grep", "Glob")
+PROJECT_AGENTS_DIR = os.path.join(".orca-dash", "agents")  # 저장소 안 프로젝트별 에이전트 정의
 
 
 @dataclass
 class DraftAgent:
     """AI 초안을 쓰는 '작성 에이전트': 역할 지시문 + 필요한 컨텍스트 목록.
 
-    공급자(claude/codex)·모델·제한 시간은 전역 설정이고, 에이전트는 '무엇을 보고 어떤 관점으로 쓸지'만 정한다.
-    내장 에이전트 외에 <설정 디렉터리>/agents/<id>.md 로 추가할 수 있다 (load_user_agents 참고).
+    공급자(claude/codex)는 전역 설정이고, 에이전트는 '무엇을 보고 어떤 관점으로 쓸지'를 정한다. model·timeout 을
+    적으면 그 에이전트만 전역 모델·제한 시간 대신 그 값을 쓰고, tools 를 적으면 저장소를 직접 읽는다.
+    내장 에이전트 외에 <설정 디렉터리>/agents/<id>.md 와 저장소 안 .orca-dash/agents/<id>.md 로 추가할 수 있다
+    (load_agents 참고).
     """
     id: str
     name: str
@@ -404,6 +414,9 @@ class DraftAgent:
     steps: tuple[str, ...] = ()  # 생각의 흐름: 답을 쓰기 전에 순서대로 거치는 생각 단계 (옵션 > 에이전트 탭에서 편집)
     memo: bool = True  # 사용자 메모를 요청에 넣을지. 메모가 방향을 흐리는 역할(목표 지향)은 끈다 — md 의 'memo: off'
     final: bool = False  # 최종 결정 에이전트: 다른 에이전트들의 초안을 [에이전트 초안]으로 받아 하나로 정한다 — md 의 'final: on'
+    tools: tuple[str, ...] = ()  # 저장소를 직접 읽는 도구 (READ_TOOLS 중에서) — md 의 'tools: Read, Grep, Glob'. claude 에서만 쓰임
+    model: str | None = None     # 이 에이전트만 쓸 모델. None 이면 전역 설정 — md 의 'model: sonnet'
+    timeout: float | None = None  # 이 에이전트만 쓸 제한 시간(초). None 이면 전역 설정 — md 의 'timeout: 120'
 
     @property
     def label(self) -> str:
@@ -433,6 +446,7 @@ BUILTIN_AGENTS: list[DraftAgent] = [
         id="review", name="문제 발견",
         description="변경분에서 버그·누락·테스트 공백을 찾아 수정 지시를 쓴다",
         context=("instruction", "last_message", "diff", "log"),
+        tools=READ_TOOLS,  # 잘린 diff 만으로 단정하지 않도록 저장소를 직접 읽는다
         steps=("변경분에서 바뀐 파일과 함수를 파악한다",
                "각 변경의 입력·경계 조건·실패 경로를 따라가며 문제를 찾는다",
                "테스트가 그 변경을 덮는지 확인한다",
@@ -442,12 +456,14 @@ BUILTIN_AGENTS: list[DraftAgent] = [
 - '변경분'을 읽고 버그, 빠진 예외 처리, 경계 조건, 동시성·자원 누수, 테스트 공백, 원래 지시와 어긋난 구현을 찾는다.
 - 찾은 문제는 파일 경로(가능하면 함수명)와 함께 무엇이 왜 문제인지 한 줄씩 적고, 고치라는 지시로 마무리한다.
 - 문제가 없으면 테스트나 확인 절차를 추가하라는 지시를 쓴다. 변경분이 없으면 마지막 응답을 바탕으로 검증을 요청한다.
+- 변경분에서 의심되는 곳은 파일을 직접 읽어 확인한 뒤 쓴다. 읽지 못한 것은 추측하지 않는다.
 """),
     DraftAgent(
         id="final", name="최종 결정",
         description="다른 에이전트들의 초안을 평가해 보낼 프롬프트 하나로 정한다",
         context=("instruction", "last_message"),
         final=True,  # 작성 에이전트들이 끝난 뒤 마지막에 한 번 실행된다
+        tools=READ_TOOLS,  # 초안이 말하는 파일·함수가 실제로 그런지 확인하고 정한다
         steps=("각 초안이 마지막 응답의 질문·대기 사유에 답하는지, 원래 지시와 사용자 메모에 맞는지 평가한다",
                "초안끼리 충돌하는 지시를 찾아 어느 쪽을 택할지 정한다 (사용자 메모가 있으면 그 의도를 우선)",
                "택한 내용을 중복 없이 하나의 지시로 합치고, 상황에 없는 파일·명령은 뺀다",
@@ -458,6 +474,7 @@ BUILTIN_AGENTS: list[DraftAgent] = [
 - 초안끼리 충돌하면 마지막 응답의 질문에 직접 답하는 쪽, 사용자 메모의 의도에 가까운 쪽을 택한다. 양쪽을 다 하라고 늘어놓지 않는다.
 - 결과는 가장 긴 초안보다 길지 않게 하고, 초안에 없는 새 작업은 더하지 않는다.
 - '에이전트 초안' 절이 없으면 상황과 메모로 직접 쓴다.
+- 변경분이나 초안에서 의심되는 곳은 파일을 직접 읽어 확인한 뒤 쓴다. 읽지 못한 것은 추측하지 않는다.
 """),
 ]
 DEFAULT_AGENT = BUILTIN_AGENTS[0].id
@@ -465,6 +482,49 @@ DEFAULT_AGENT = BUILTIN_AGENTS[0].id
 
 def agents_dir(config_path: str) -> str:
     return os.path.join(os.path.dirname(config_path) or ".", "agents")
+
+
+_MACHINE_KEYS = ("context", "memo", "final", "tools", "model", "timeout")  # 값이 정해진 형식인 frontmatter 키
+
+
+def check_tools(tools) -> tuple[str, ...]:
+    """도구 이름을 READ_TOOLS 표기로 맞춘다(대소문자 무시, 중복 제거). 읽기 전용이 아닌 도구가 있으면 ConfigError."""
+    canon = {t.lower(): t for t in READ_TOOLS}
+    out: list[str] = []
+    bad: list[str] = []
+    for t in tools or ():
+        name = canon.get(str(t).strip().lower())
+        if name is None:
+            bad.append(str(t).strip())
+        elif name not in out:
+            out.append(name)
+    if bad:
+        raise ConfigError(f"tools 에 쓸 수 없는 도구 — {', '.join(bad)} "
+                          f"(읽기 전용 {', '.join(READ_TOOLS)} 만 가능, 쓰기·실행 도구는 허용하지 않음)")
+    return tuple(out)
+
+
+def check_model(raw) -> str | None:
+    """빈 값은 None(전역 설정). 명령줄 인자로 그대로 넘기므로 공백이 있거나 '-' 로 시작하면 ConfigError."""
+    model = str(raw or "").strip()
+    if not model:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/\[\]@-]*", model):
+        raise ConfigError(f"model 은 모델 이름 하나 — {model}")
+    return model
+
+
+def check_timeout(raw) -> float | None:
+    """빈 값은 None(전역 설정). 0보다 큰 수(초)가 아니면 ConfigError."""
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        timeout = float(str(raw).strip())
+    except ValueError:
+        timeout = 0.0
+    if not (0 < timeout < float("inf")):
+        raise ConfigError(f"timeout 은 0보다 큰 수(초) — {str(raw).strip()}")
+    return timeout
 
 
 def parse_agent_file(path: str) -> DraftAgent:
@@ -477,6 +537,9 @@ def parse_agent_file(path: str) -> DraftAgent:
         step: 바뀐 함수를 파악한다          (선택, 반복 가능 — 생각의 흐름 기본값. 옵션 > 에이전트 탭에서 덮어씀)
         memo: off                        (선택, 기본 on — off 면 사용자 메모를 요청에 넣지 않음)
         final: on                        (선택, 기본 off — on 이면 최종 결정 에이전트: 다른 초안을 받아 하나로 정함)
+        tools: Read, Grep, Glob          (선택, 기본 없음 — 저장소를 직접 읽는 도구. Read·Grep·Glob 만 가능)
+        model: sonnet                    (선택 — 이 에이전트만 전역 모델 대신 쓸 모델)
+        timeout: 120                     (선택 — 이 에이전트만 전역 제한 시간 대신 쓸 초)
         ---
         역할 지시문 본문…
 
@@ -504,6 +567,8 @@ def parse_agent_file(path: str) -> DraftAgent:
             k, v = line.split(":", 1)
             if k.strip().lower() in ("step", "steps"):
                 steps.append(v.strip())
+            elif k.strip().lower() in _MACHINE_KEYS:
+                meta[k.strip().lower()] = re.sub(r"(^|\s)#.*$", "", v).strip()  # 값 뒤 '# 설명' 주석 허용
             else:
                 meta[k.strip().lower()] = v.strip()
         body = "\n".join(lines[close + 1:])
@@ -520,33 +585,42 @@ def parse_agent_file(path: str) -> DraftAgent:
         if raw not in ("on", "off", "yes", "no", "true", "false", "1", "0"):
             raise ConfigError(f"{path}: {key} 는 on 또는 off — {raw}")
         flags[key] = raw in ("on", "yes", "true", "1")
+    try:
+        tools = check_tools(_split_list(meta.get("tools", "")))
+        model = check_model(meta.get("model"))
+        timeout = check_timeout(meta.get("timeout"))
+    except ConfigError as e:
+        raise ConfigError(f"{path}: {e}") from None
     if not body.strip():
         raise ConfigError(f"{path}: 지시문 본문이 비어 있음")
     return DraftAgent(id=agent_id, name=name, description=meta.get("description", "").strip(),
                       instructions=body.strip() + "\n", context=ctx, builtin=False, path=path,
-                      steps=tuple(x for x in steps if x), memo=flags["memo"], final=flags["final"])
+                      steps=tuple(x for x in steps if x), memo=flags["memo"], final=flags["final"],
+                      tools=tools, model=model, timeout=timeout)
 
 
 def load_agents(config_path: str, step_overrides: dict[str, list[str]] | None = None,
-                include_hidden: bool = False) -> tuple[list[DraftAgent], list[str]]:
-    """내장 에이전트에 사용자 정의(agents/*.md)를 합친다. 같은 id 면 사용자 정의가 내장을 덮는다.
-    step_overrides(설정의 agent_steps)에 있는 id 는 생각의 흐름을 그 값으로 바꾼다.
-    잘못된 파일은 건너뛰고 오류 메시지 목록으로 돌려준다.
+                include_hidden: bool = False, repo_dir: str | None = None) -> tuple[list[DraftAgent], list[str]]:
+    """내장 에이전트에 사용자 정의(<설정 디렉터리>/agents/*.md)를 합치고, repo_dir 가 있으면 그 저장소의
+    프로젝트별 정의(.orca-dash/agents/*.md)를 그 뒤에 읽는다. 같은 id 면 뒤에 읽은 것이 덮는다
+    (내장 < 사용자 < 프로젝트). step_overrides(설정의 agent_steps)에 있는 id 는 생각의 흐름을 그 값으로 바꾼다.
+    잘못된 파일은 건너뛰고(그 id 는 앞 단계 정의가 남는다) 오류 메시지 목록으로 돌려준다.
     프롬프트 초안을 쓰지 않는 숨은 에이전트(HIDDEN_AGENT_IDS — 진행 판정)는 include_hidden 일 때만 넣는다."""
     agents = {a.id: a for a in BUILTIN_AGENTS + SYSTEM_AGENTS}
     errors: list[str] = []
-    d = agents_dir(config_path)
-    try:
-        names = sorted(n for n in os.listdir(d) if n.endswith(".md"))
-    except OSError:
-        names = []
-    for n in names:
+    dirs = [agents_dir(config_path)] + ([os.path.join(repo_dir, PROJECT_AGENTS_DIR)] if repo_dir else [])
+    for d in dirs:
         try:
-            a = parse_agent_file(os.path.join(d, n))
-        except (ConfigError, OSError) as e:
-            errors.append(str(e))
-            continue
-        agents[a.id] = a
+            names = sorted(n for n in os.listdir(d) if n.endswith(".md"))
+        except OSError:
+            names = []
+        for n in names:
+            try:
+                a = parse_agent_file(os.path.join(d, n))
+            except (ConfigError, OSError) as e:
+                errors.append(str(e))
+                continue
+            agents[a.id] = a
     for aid, steps in (step_overrides or {}).items():
         if aid in agents:
             agents[aid] = dataclasses.replace(agents[aid], steps=tuple(steps))
@@ -719,21 +793,65 @@ def agent_json(agent: DraftAgent) -> str:
     return json.dumps(spec, ensure_ascii=False, indent=2)
 
 
-def draft_system_prompt(agent: DraftAgent) -> str:
-    return (VERDICT_SYSTEM if agent.id == VERDICT_AGENT_ID else DRAFT_SYSTEM) + f"\n[역할] (character: {agent.id})\n" + agent.instructions.strip() + "\n"
+TOOLS_SYSTEM = """[도구]
+이번 호출에서는 {tools} 도구로 에이전트가 작업 중인 저장소(현재 작업 디렉터리)를 읽을 수 있다. 읽기 전용이다.
+- 프롬프트를 쓰기 전에 반드시 도구를 써서, 상황의 변경분·마지막 응답이 말하는 파일과 함수를 직접 열어 확인한다.
+  변경분은 길면 잘려서 오므로 잘린 부분과 변경된 함수의 주변 코드는 파일에서 읽는다. 경로는 저장소 기준 상대 경로로 쓴다.
+- 확인한 사실만 근거로 쓰고, 읽지 못했거나 읽기가 거절된 것은 추측하지 않는다.
+- 도구 사용 과정이나 읽은 내용의 요약은 출력하지 않는다. 마지막 출력은 프롬프트 본문뿐이다.
+"""
+
+
+def draft_system_prompt(agent: DraftAgent, tools: tuple[str, ...] = ()) -> str:
+    """시스템 프롬프트. tools 는 이번 호출에서 실제로 준 도구 — 있으면 쓰라는 [도구] 절을 붙인다
+    (없으면 작은 모델은 도구를 받아도 쓰지 않고 바로 답한다)."""
+    base = VERDICT_SYSTEM if agent.id == VERDICT_AGENT_ID else DRAFT_SYSTEM
+    return (base + f"\n[역할] (character: {agent.id})\n" + agent.instructions.strip() + "\n"
+            + ("\n" + TOOLS_SYSTEM.format(tools="·".join(tools)) if tools else ""))
+
+
+def agent_tools(cfg: AIConfig, agent: DraftAgent, repo_dir: str | None) -> tuple[str, ...]:
+    """이번 호출에서 실제로 줄 도구. 읽을 로컬 저장소가 없거나(원격), 「에이전트 상황 전달」이 꺼져 있으면
+    (상태 한 줄 외에는 보내지 않는다는 약속) 도구를 주지 않는다. 읽기 전용이 아닌 도구가 있으면 ConfigError."""
+    tools = check_tools(agent.tools)
+    if not tools or not cfg.include_context or not repo_dir or not os.path.isdir(repo_dir):
+        return ()
+    return tools
+
+
+def claude_command(cfg: AIConfig, agent: DraftAgent, system: str, repo_dir: str | None = None) -> list[str]:
+    """claude -p 명령줄. 도구가 있으면 내장 도구를 그 목록으로 한정하고(--tools), 권한 질문이 필요한 것은 묻지 않고
+    거절하게 하며(--permission-mode dontAsk: 작업 디렉터리 안 읽기는 질문 없이 되고 밖은 거절된다), 사용자 MCP
+    서버의 도구가 끼어들지 않게 한다(--strict-mcp-config). --allowedTools 로 미리 승인하면 저장소 밖 파일까지
+    읽히므로 쓰지 않는다. 에이전트의 model 이 있으면 전역 모델보다 우선한다."""
+    tools = agent_tools(cfg, agent, repo_dir)
+    cmd = ["claude", "-p", "--no-session-persistence", "--tools", ",".join(tools)]
+    if tools:
+        cmd += ["--permission-mode", "dontAsk", "--strict-mcp-config"]
+    cmd += ["--output-format", "json", "--system-prompt", system]
+    model = agent.model or cfg.model
+    if model:
+        cmd += ["--model", model]
+    return cmd
 
 
 async def draft_prompt(cfg: AIConfig, agent: DraftAgent, row: Row, note: str, current: str,
                        cwd: str | None, repo_dir: str | None = None, drafts: str = "") -> str:
-    """AI 로 프롬프트 초안을 만든다. 실패 시 DraftError."""
+    """AI 로 프롬프트 초안을 만든다. 실패 시 DraftError. 에이전트의 model·timeout 이 있으면 전역 설정보다
+    우선하고, tools 가 있으면(claude) 저장소를 작업 디렉터리로 두어 상대 경로로 읽게 한다."""
     request = await build_draft_request(agent, row, note, current, cfg.include_context, repo_dir, drafts)
     system = draft_system_prompt(agent)
+    model = agent.model or cfg.model
+    timeout = agent.timeout or cfg.timeout
     if cfg.provider == "claude":
-        cmd = ["claude", "-p", "--no-session-persistence", "--tools", "", "--output-format", "json",
-               "--system-prompt", system]
-        if cfg.model:
-            cmd += ["--model", cfg.model]
-        raw = await _run_cli(cmd, request, cwd, cfg.timeout)
+        try:
+            tools = agent_tools(cfg, agent, repo_dir)
+            cmd = claude_command(cfg, agent, draft_system_prompt(agent, tools), repo_dir)
+        except ConfigError as e:
+            raise DraftError(f"{agent.name}: {e}") from None
+        if tools:
+            cwd = repo_dir  # 상대 경로 읽기가 저장소 기준이 되고, 권한 없이 읽히는 범위도 저장소로 한정된다
+        raw = await _run_cli(cmd, request, cwd, timeout)
         try:
             data = json.loads(raw[raw.index("{"):])
         except (ValueError, json.JSONDecodeError):
@@ -749,10 +867,10 @@ async def draft_prompt(cfg: AIConfig, agent: DraftAgent, row: Row, note: str, cu
                    "-o", out_path]
             if cwd:
                 cmd += ["-C", cwd]
-            if cfg.model:
-                cmd += ["-m", cfg.model]
-            cmd.append("-")  # 프롬프트는 stdin
-            await _run_cli(cmd, system + "\n\n" + request, cwd, cfg.timeout)
+            if model:
+                cmd += ["-m", model]
+            cmd.append("-")  # 프롬프트는 stdin. 도구 설정은 쓰지 않는다 — 이미 읽기 전용 샌드박스(-s read-only)
+            await _run_cli(cmd, system + "\n\n" + request, cwd, timeout)
             with open(out_path, encoding="utf-8", errors="replace") as f:
                 text = strip_fences(f.read())
         finally:
@@ -2174,7 +2292,10 @@ class SettingsScreen(ModalScreen[Settings | None]):
                 + ("" if a.memo else "  ·  사용자 메모: 받지 않음")
                 + ("  ·  최종 결정: 다른 에이전트들의 초안을 받아 하나로 정함" if a.final else "")
                 + ("  ·  프롬프트 초안용이 아님: 프롬프트 창 Ctrl+T 와 자동 전송 루프가 호출"
-                   if a.id in HIDDEN_AGENT_IDS else ""))
+                   if a.id in HIDDEN_AGENT_IDS else "")
+                + (f"  ·  도구: {', '.join(a.tools)} (저장소 읽기 전용, claude)" if a.tools else "")
+                + (f"  ·  모델: {a.model}" if a.model else "")
+                + (f"  ·  제한 시간: {a.timeout:g}초" if a.timeout else ""))
 
     def _step_rows(self, steps: list[str]) -> list:
         """단계 편집 행 위젯들. compose 와 mount 양쪽에서 쓰므로 컨텍스트 매니저 대신 직접 만든다."""
@@ -2595,7 +2716,8 @@ class OrcaDash(App):
             return
 
         repo_dir = row.path if (src.label == "local" and row.path and os.path.isdir(row.path)) else None
-        agents, agent_errors = load_agents(self.config_path, self.settings.agent_steps)  # 열 때마다 읽어 새 파일이 바로 보이게
+        # 열 때마다 읽어 새 파일이 바로 보이게. 로컬 저장소면 그 안의 .orca-dash/agents/ 정의가 같은 id 를 덮는다
+        agents, agent_errors = load_agents(self.config_path, self.settings.agent_steps, repo_dir=repo_dir)
         screen = PromptScreen(row, self.ai, repo_dir or tempfile.gettempdir(), repo_dir=repo_dir,
                               agents=agents, agent_ids=self.settings.ai_agents, agent_errors=agent_errors)
         self._attach_proposal(screen, row)
@@ -2802,7 +2924,7 @@ class OrcaDash(App):
         status="error" 인 제안을 돌려준다. 만드는 사이 행이 바뀌었거나 사용자가 직접 만든 초안이 들어왔으면
         결과를 버린다 (status="stale", 저장소에는 넣지 않음)."""
         prev = self.proposals.current(row)
-        agents, _ = load_agents(self.config_path, self.settings.agent_steps)
+        agents, _ = load_agents(self.config_path, self.settings.agent_steps, repo_dir=self._repo_dir(row))
         chain = pick_agents(agents, self.settings.ai_agents)
         p = Proposal(row.key, "", [a.id for a in chain], time.time(), row.updated_at, "drafting",
                      attempts=(prev.attempts if prev else 0) + 1)
