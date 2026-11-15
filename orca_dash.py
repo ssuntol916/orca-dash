@@ -13,6 +13,10 @@ Orca 1.4.230 출력 구조 기준으로 작성.
              문제 발견(review, git 변경분에서 문제를 찾음) · 최종 결정(final, 다른 초안들을 받아 하나로 정함).
              여러 개를 체크하면 각자 독립적으로 초안을 쓰고 체크한 순서로 '[이름]' 머리말을 붙여 묶으며,
              최종 결정을 함께 체크하면 그 묶음을 받아 프롬프트 하나로 정한다. ~/.config/orca-dash/agents/<id>.md 로 추가 가능
+             옵션의 「백그라운드 제안」을 켜면 입력 대기·권한 대기·막힘 행이 생기거나 바뀔 때 창을 열지 않아도 뒤에서
+             작성 에이전트 체인이 (메모 없이) 한 번에 하나씩 돌아 제안을 준비한다. 상태 열에 '제안 …'(작성 중) ·
+             '제안 ✓'(준비됨) · '제안 ✗'(실패)로 보이고, 프롬프트 창을 열면 입력창에 들어와 있어 Enter 만 누르면 된다
+             (Ctrl+G 는 다듬기). 행의 갱신 시각이 바뀌면 버리고 다시 만들며, 실패는 같은 갱신 시각에 2번까지만 시도한다
   o          옵션 보기/수정 (조회 간격·소스·AI). 저장하면 설정 파일에 쓰고 바로 적용.
              「에이전트」 탭에서 작성 에이전트별 '생각의 흐름'(답을 쓰기 전에 거치는 생각 단계)을 +/- 로 편집
   r 새로고침 · f 필터 · e 빈 워크트리 · q 종료
@@ -50,6 +54,7 @@ import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from rich.markup import escape
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -816,6 +821,83 @@ async def draft_each(cfg: AIConfig, agents: list[DraftAgent], row: Row, note: st
     return final
 
 
+# ---------------------------------------------------------------------------
+# 백그라운드 제안: 사람이 프롬프트 창을 열기 전에 작성 에이전트 체인을 미리 돌려 둔 결과.
+# 메모리에만 두고 행 키로 찾는다. 행의 updated_at 이 바뀌면(에이전트가 다시 움직였으면) 무효다.
+# ---------------------------------------------------------------------------
+# 사람의 다음 지시가 필요한 상태: STATE_STYLE 에서 '작업 중'보다 앞에 오는 것(막힘·입력 대기·권한 대기)과
+# Orca 가 긴 이름으로 주는 같은 뜻의 상태.
+PROPOSAL_STATES = frozenset({s for s, style in STATE_STYLE.items() if s and style[2] <= 1}
+                            | {"waiting_input", "waiting_permission"})
+PROPOSAL_MAX_ATTEMPTS = 2  # 같은 updated_at 에 대해 실패한 제안을 다시 시도하는 상한 (첫 시도 포함)
+
+
+@dataclass
+class Proposal:
+    row_key: str
+    text: str
+    agent_ids: list[str]
+    created_at: float                 # epoch 초
+    row_updated_at: float | None      # 만들 때 그 행의 updated_at — 행의 값과 다르면 무효
+    status: str = "ready"             # drafting(작성 중) | ready(준비됨) | error(실패) | sent(이미 보냄)
+    error: str = ""                   # status 가 error 일 때 사유
+    attempts: int = 1                 # 이 updated_at 에 대해 시도한 횟수
+
+
+class ProposalStore:
+    """행 키별 제안 하나. get/put/invalidate 는 계약된 이름이고, 나머지는 유효성 판단을 한곳에 모은 것."""
+
+    def __init__(self) -> None:
+        self._items: dict[str, Proposal] = {}
+
+    def get(self, row_key: str) -> Proposal | None:
+        return self._items.get(row_key)
+
+    def put(self, proposal: Proposal) -> None:
+        self._items[proposal.row_key] = proposal
+
+    def invalidate(self, row_key: str) -> None:
+        self._items.pop(row_key, None)
+
+    def current(self, row: Row) -> Proposal | None:
+        """그 행의 지금 updated_at 에 대해 만든 제안 (상태 무관). 행이 그 뒤 바뀌었으면 None."""
+        p = self._items.get(row.key)
+        return p if p is not None and p.row_updated_at == row.updated_at else None
+
+    def valid(self, row: Row) -> Proposal | None:
+        """바로 쓸 수 있는 제안: 준비됐고 본문이 있으며 행이 그 뒤로 바뀌지 않았다."""
+        p = self.current(row)
+        return p if p is not None and p.status == "ready" and p.text.strip() else None
+
+    def sync(self, rows: list[Row]) -> list[str]:
+        """새로 조회한 행들과 맞춘다: updated_at 이 달라진 행의 제안을 버리고 그 키들을 돌려준다.
+        조회에서 잠깐 빠진 행(소스 오류 등)의 제안은 그대로 둔다."""
+        stale = [r.key for r in rows if r.key in self._items and self._items[r.key].row_updated_at != r.updated_at]
+        for k in stale:
+            del self._items[k]
+        return stale
+
+    def mark_sent(self, row: Row) -> None:
+        """그 행에 프롬프트를 보냈다. 조회가 아직 옛 상태를 돌려주는 동안 같은 제안을 다시 만들지 않도록
+        지우지 않고 '보냄'으로 남긴다 (행이 갱신되면 sync 가 버린다)."""
+        p = self.current(row)
+        if p is None:
+            p = Proposal(row.key, "", [], time.time(), row.updated_at)
+            self.put(p)
+        p.status = "sent"
+
+
+def needs_proposal(row: Row, store: ProposalStore) -> bool:
+    """이 행의 제안을 (다시) 만들어야 하는가: 사람 개입이 필요한 상태의 에이전트이고, 지금 updated_at 에 대한
+    제안이 없거나 실패한 제안이 재시도 상한에 못 미쳤을 때."""
+    if row.state not in PROPOSAL_STATES or not row.pane_key:
+        return False
+    p = store.current(row)
+    if p is None:
+        return True
+    return p.status == "error" and p.attempts < PROPOSAL_MAX_ATTEMPTS
+
+
 class PromptArea(TextArea):
     """Enter 는 전송, Ctrl+J / Shift+Enter / Alt+Enter 는 줄바꿈.
 
@@ -883,6 +965,8 @@ class PromptScreen(ModalScreen[str | None]):
         self.note: str | None = None        # AI 에 준 사용자 메모 (다듬기 때 재사용)
         self.last_draft: str | None = None  # 마지막으로 받은 초안
         self.draft_worker: Worker | None = None
+        self.proposal: Proposal | None = None  # 백그라운드 제안: 있으면 열 때 입력창에 넣는다 (앱이 열기 전에 채움)
+        self.on_draft = None                   # 초안이 끝나면 on_draft(본문, 에이전트 id 목록) — 앱이 제안 저장소에 넣는다
 
     def compose(self) -> ComposeResult:
         r = self.row
@@ -909,6 +993,28 @@ class PromptScreen(ModalScreen[str | None]):
         self.query_one(TextArea).focus()
         if self.ai and self.agent_errors:
             self._set_ai_status(f"에이전트 파일 오류 {len(self.agent_errors)}건 (건너뜀): {self.agent_errors[0]}")
+        self._apply_proposal()
+
+    def _apply_proposal(self) -> None:
+        """백그라운드 제안이 준비돼 있으면 입력창에 넣고 last_draft 로 등록한다 — 다음 Ctrl+G 는 다듬기가 된다."""
+        p = self.proposal
+        if p is None:
+            return
+        if p.status == "ready" and p.text.strip():
+            area = self.query_one(TextArea)
+            area.load_text(p.text)
+            area.move_cursor(area.document.end)
+            self.last_draft = p.text
+            self.note = ""   # 제안은 메모 없이 만든다
+            writers, decider = split_run(pick_agents(self.agents, p.agent_ids))
+            names = " → ".join(a.name for a in writers) + (f" ⇒ {decider.name}" if decider and writers
+                                                           else decider.name if decider else "")
+            self._set_ai_status(f"백그라운드 제안({names} · {_ago(p.created_at * 1000)} 전)을 넣었습니다. "
+                                "수정 후 Enter 로 전송" + (" · Ctrl+G 로 다듬기" if self.ai else ""))
+        elif p.status == "error":
+            self._set_ai_status(f"백그라운드 제안 실패: {p.error}" + (" · Ctrl+G 로 직접 작성" if self.ai else ""))
+        elif p.status == "drafting":
+            self._set_ai_status("백그라운드 제안 작성 중 (기다리지 않고 Ctrl+G 로 직접 작성할 수 있음)")
 
     @property
     def chain(self) -> list[DraftAgent]:
@@ -1023,6 +1129,8 @@ class PromptScreen(ModalScreen[str | None]):
             names = " → ".join(a.name for a in writers) + (f" ⇒ {decider.name}" if decider and writers
                                                            else decider.name if decider else "")
             self._set_ai_status(f"AI 초안({names})을 넣었습니다. 수정 후 Enter 로 전송 · Ctrl+G 로 다듬기")
+            if self.on_draft and draft.strip():
+                self.on_draft(draft, [a.id for a in self.chain])
         elif event.state == WorkerState.ERROR:
             err = event.worker.error
             self._set_ai_status("")
@@ -1097,9 +1205,11 @@ class Settings:
     ai_agents: list[str] = field(default_factory=lambda: [DEFAULT_AGENT])  # 작성 에이전트 id 들, 실행 순서 (마지막에 쓴 것으로 갱신)
     agent_steps: dict[str, list[str]] = field(default_factory=dict)  # 에이전트별 생각의 흐름 (없는 id 는 에이전트 기본값)
     auto_abc: bool = True                           # macOS: 메인 화면에서 입력 소스를 영문으로 자동 전환
+    auto_draft: bool = False                        # 사람 개입이 필요한 행의 제안을 백그라운드로 미리 만든다
 
     FIELDS = ("interval", "orca", "local", "env", "host", "ssh",
-              "ai", "ai_model", "ai_timeout", "ai_context", "ai_agents", "agent_steps", "auto_abc")
+              "ai", "ai_model", "ai_timeout", "ai_context", "ai_agents", "agent_steps", "auto_abc",
+              "auto_draft")
 
     @classmethod
     def load(cls, path: str) -> "Settings":
@@ -1171,6 +1281,7 @@ class Settings:
                                          if str(x).strip()]
                                 for k, v in self.agent_steps.items() if str(k).strip()}
         self.auto_abc = bool(self.auto_abc)
+        self.auto_draft = bool(self.auto_draft)
         if not self.local and not (self.env or self.host or self.ssh):
             errs.append("조회할 소스가 없음 (로컬을 끄면 env/host/ssh 중 하나 필요)")
         return errs
@@ -1464,6 +1575,9 @@ class SettingsScreen(ModalScreen[Settings | None]):
                 yield Label("사용 가능: " + " · ".join(f"{a.id}({a.name})" for a in self.agents)
                             + f"\n추가: {agents_dir(self.path)}/<id>.md (frontmatter name·description·context + 지시문). "
                               "프롬프트 창에서도 체크해 고를 수 있음 · 생각의 흐름은 「에이전트」 탭", classes="hint")
+                yield from row("백그라운드 제안", Checkbox(
+                    "입력 대기·권한 대기·막힘 행의 프롬프트를 위 작성 에이전트로 미리 만들어 둠 (메모 없이, 한 번에 하나씩)",
+                    s.auto_draft, id="auto_draft"))
                 yield Label("키보드", classes="section")
                 yield from row("영문 자동 전환", Checkbox(
                     "메인 화면이 앞에 있을 때 입력 소스를 영문으로 바꿔 한글 상태에서도 단축키가 듣게 함 (macOS)",
@@ -1548,6 +1662,7 @@ class SettingsScreen(ModalScreen[Settings | None]):
             ai_agents=q("#ai_agents", Input).value,
             agent_steps=self._collect_steps(),
             auto_abc=q("#auto_abc", Checkbox).value,
+            auto_draft=q("#auto_draft", Checkbox).value,
         )
 
     def action_save(self) -> None:
@@ -1633,6 +1748,9 @@ class OrcaDash(App):
         self.show_empty = False
         self.last_fetch: float | None = None
         self.errors: list[str] = []
+        self.proposals = ProposalStore()            # 백그라운드 제안 (행 키별)
+        self._proposal_queue: list[str] = []        # 제안을 만들 행 키, 앞에서부터 하나씩
+        self._proposal_worker: Worker | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -1792,6 +1910,7 @@ class OrcaDash(App):
         self.errors = [e for _, e in results if e]
         self.last_fetch = time.time()
         self.query_one("#errors", Static).update("\n".join(self.errors))
+        self._queue_proposals()
         self._render_table()
 
     def action_cycle_filter(self) -> None:
@@ -1832,6 +1951,7 @@ class OrcaDash(App):
                 state_txt.append(f" (주:{STATE_STYLE.get(r.main_state, (r.main_state,))[0]})", style="dim")
             if r.wait:
                 state_txt.append(f" · {r.wait}", style="yellow")
+            self._append_proposal_tag(state_txt, r)
             wt = Text(("● " if r.unread else "") + r.worktree)
             table.add_row(state_txt, _ago(r.started_at), r.host, r.repo, wt, r.branch,
                           r.agent_type, r.tool, _clock(r.updated_at), r.summary, key=r.key)
@@ -1899,6 +2019,7 @@ class OrcaDash(App):
         agents, agent_errors = load_agents(self.config_path, self.settings.agent_steps)  # 열 때마다 읽어 새 파일이 바로 보이게
         screen = PromptScreen(row, self.ai, repo_dir or tempfile.gettempdir(), repo_dir=repo_dir,
                               agents=agents, agent_ids=self.settings.ai_agents, agent_errors=agent_errors)
+        self._attach_proposal(screen, row)
 
         def on_result(text: str | None) -> None:
             chosen = [a.id for a in screen.chain]
@@ -1922,7 +2043,109 @@ class OrcaDash(App):
             self.notify(f"{target}: {e}", title="전송 실패", severity="error", timeout=10)
             return
         self.notify(f"{target}: {msg}", title="프롬프트 전송", timeout=6)
+        self.proposals.mark_sent(row)
+        self._proposals_changed()
         self.set_timer(2, self.action_refresh)
+
+    # --- 백그라운드 제안 --------------------------------------------------------
+    def _repo_dir(self, row: Row) -> str | None:
+        """로컬 저장소 경로 (action_send_prompt 와 같은 기준). 원격·파일 소스거나 경로가 없으면 None."""
+        src = self.source_by_label.get(row.source)
+        return row.path if (src is not None and src.label == "local" and row.path and os.path.isdir(row.path)) else None
+
+    def _queue_proposals(self) -> None:
+        """새로고침 뒤: 바뀐 행의 제안을 버리고, 제안이 필요한 행을 큐에 넣어 한 번에 하나씩 만든다."""
+        self.proposals.sync(self.rows)
+        if not (self.settings.auto_draft and self.ai.enabled):
+            self._proposal_queue.clear()
+            return
+        order = sorted(self.rows, key=lambda r: (STATE_STYLE.get(r.state, ("", "", 9))[2], -(r.updated_at or 0)))
+        for r in order:
+            src = self.source_by_label.get(r.source)
+            if src is None or src.file:   # 파일 소스는 보낼 수 없으니 제안도 만들지 않는다
+                continue
+            if r.key not in self._proposal_queue and needs_proposal(r, self.proposals):
+                self._proposal_queue.append(r.key)
+        running = self._proposal_worker is not None and self._proposal_worker.is_running
+        if self._proposal_queue and not running:
+            self._proposal_worker = self.run_worker(self._proposal_loop(), group="proposals", exclusive=True,
+                                                    exit_on_error=False)
+
+    async def _proposal_loop(self) -> None:
+        while self._proposal_queue:
+            key = self._proposal_queue.pop(0)
+            row = next((r for r in self.rows if r.key == key), None)   # 기다리는 동안 행이 바뀌었을 수 있다
+            if (row is None or not (self.settings.auto_draft and self.ai.enabled)
+                    or not needs_proposal(row, self.proposals)):
+                continue
+            await self._propose(row)
+
+    async def _propose(self, row: Row) -> Proposal:
+        """설정의 작성 에이전트 조합으로 (메모 없이) 이 행의 제안을 만들어 저장소에 넣는다. 실패해도 예외 대신
+        status="error" 인 제안을 돌려준다. 만드는 사이 행이 바뀌었거나 사용자가 직접 만든 초안이 들어왔으면
+        결과를 버린다 (status="stale", 저장소에는 넣지 않음)."""
+        prev = self.proposals.current(row)
+        agents, _ = load_agents(self.config_path, self.settings.agent_steps)
+        chain = pick_agents(agents, self.settings.ai_agents)
+        p = Proposal(row.key, "", [a.id for a in chain], time.time(), row.updated_at, "drafting",
+                     attempts=(prev.attempts if prev else 0) + 1)
+        self.proposals.put(p)
+        self._proposals_changed()
+        repo_dir = self._repo_dir(row)
+        text, error = "", ""
+        try:
+            text = await draft_each(self.ai, chain, row, "", {}, repo_dir or tempfile.gettempdir(), repo_dir)
+        except asyncio.CancelledError:
+            if self.proposals.get(row.key) is p:
+                self.proposals.invalidate(row.key)
+            raise
+        except Exception as e:  # DraftError 외의 예기치 못한 오류도 워커를 죽이지 않고 사유로 남긴다
+            error = str(e) or type(e).__name__
+        p.created_at = time.time()
+        if self.proposals.get(row.key) is not p:
+            p.status = "stale"
+            return p
+        if not error and not text.strip():
+            error = "빈 응답"
+        p.text, p.error, p.status = text, error, ("error" if error else "ready")
+        self._proposals_changed()
+        return p
+
+    def _store_draft(self, row: Row, text: str, agent_ids: list[str]) -> None:
+        """프롬프트 창에서 사용자가 Ctrl+G 로 만든 초안도 그 행의 제안으로 둔다."""
+        self.proposals.put(Proposal(row.key, text, list(agent_ids), time.time(), row.updated_at))
+        self._proposals_changed()
+
+    def _attach_proposal(self, screen: PromptScreen, row: Row) -> None:
+        """프롬프트 창을 열기 전: 그 행의 제안(준비·실패·작성 중)을 넘기고, 창에서 만든 초안을 받을 길을 건다."""
+        screen.proposal = self.proposals.current(row)
+        screen.on_draft = lambda text, ids: self._store_draft(row, text, ids)
+
+    def _append_proposal_tag(self, state_txt: Text, row: Row) -> None:
+        p = self.proposals.current(row)
+        tag = {"drafting": ("제안 …", "cyan"), "ready": ("제안 ✓", "bold green"),
+               "error": ("제안 ✗", "red")}.get(p.status) if p else None
+        if tag:
+            state_txt.append(" · ")
+            state_txt.append(*tag)
+
+    def _proposal_detail(self, row: Row) -> str:
+        """상세 창에 덧붙이는 제안 본문·실패 사유 (본문의 '[이름]' 머리말이 마크업으로 읽히지 않게 이스케이프)."""
+        p = self.proposals.current(row)
+        if p is None or p.status not in ("ready", "error"):
+            return ""
+        body = p.text if p.status == "ready" else f"실패 ({p.attempts}/{PROPOSAL_MAX_ATTEMPTS}회 시도): {p.error}"
+        return f"\n\n[b]제안[/] ({_ago(p.created_at * 1000)} 전)\n" + escape(body)
+
+    def _proposals_changed(self) -> None:
+        """제안 상태가 바뀌었다: 표의 표시와 상세 창을 다시 그린다 (종료 중이면 조용히 넘어감)."""
+        try:
+            self._render_table()
+            row = self._current_row()
+            if row:
+                self.query_one("#detail", Static).update(row.detail + self._proposal_detail(row))
+        except Exception:
+            pass
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         self.action_send_prompt()
@@ -1931,7 +2154,7 @@ class OrcaDash(App):
         key = event.row_key.value if event.row_key else None
         row = next((r for r in self.rows if r.key == key), None)
         if row:
-            self.query_one("#detail", Static).update(row.detail)
+            self.query_one("#detail", Static).update(row.detail + self._proposal_detail(row))
 
 
 def main() -> None:
