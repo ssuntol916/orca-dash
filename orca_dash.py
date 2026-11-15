@@ -13,6 +13,10 @@ Orca 1.4.230 출력 구조 기준으로 작성.
              문제 발견(review, git 변경분에서 문제를 찾음) · 최종 결정(final, 다른 초안들을 받아 하나로 정함).
              여러 개를 체크하면 각자 독립적으로 초안을 쓰고 체크한 순서로 '[이름]' 머리말을 붙여 묶으며,
              최종 결정을 함께 체크하면 그 묶음을 받아 프롬프트 하나로 정한다. ~/.config/orca-dash/agents/<id>.md 로 추가 가능
+  Ctrl+T     프롬프트 창에서 진행 판정: 판정 에이전트(verdict, 「진행 판정」)가 원래 지시·목표 문서·마지막 응답·
+             변경분·최근 커밋·최근 전송 기록을 보고 달성/계속/막힘과 사유 한 문장을 낸다. 결과는 창의 상태 줄과
+             표의 상태 칸(「판정 달성」「판정 막힘」)·상세·상태 줄에 남고 입력창은 건드리지 않는다. 최근 자동 전송
+             3회가 거의 같거나 그 사이 저장소 변경이 없으면 AI 를 부르지 않고 막힘으로 판정한다
   o          옵션 보기/수정 (조회 간격·소스·AI). 저장하면 설정 파일에 쓰고 바로 적용.
              「에이전트」 탭에서 작성 에이전트별 '생각의 흐름'(답을 쓰기 전에 거치는 생각 단계)을 +/- 로 편집
   r 새로고침 · f 필터 · e 빈 워크트리 · q 종료
@@ -50,6 +54,7 @@ import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from rich.markup import escape as markup_escape
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -507,12 +512,13 @@ def parse_agent_file(path: str) -> DraftAgent:
                       steps=tuple(x for x in steps if x), memo=flags["memo"], final=flags["final"])
 
 
-def load_agents(config_path: str,
-                step_overrides: dict[str, list[str]] | None = None) -> tuple[list[DraftAgent], list[str]]:
+def load_agents(config_path: str, step_overrides: dict[str, list[str]] | None = None,
+                include_hidden: bool = False) -> tuple[list[DraftAgent], list[str]]:
     """내장 에이전트에 사용자 정의(agents/*.md)를 합친다. 같은 id 면 사용자 정의가 내장을 덮는다.
     step_overrides(설정의 agent_steps)에 있는 id 는 생각의 흐름을 그 값으로 바꾼다.
-    잘못된 파일은 건너뛰고 오류 메시지 목록으로 돌려준다."""
-    agents = {a.id: a for a in BUILTIN_AGENTS}
+    잘못된 파일은 건너뛰고 오류 메시지 목록으로 돌려준다.
+    프롬프트 초안을 쓰지 않는 숨은 에이전트(HIDDEN_AGENT_IDS — 진행 판정)는 include_hidden 일 때만 넣는다."""
+    agents = {a.id: a for a in BUILTIN_AGENTS + SYSTEM_AGENTS}
     errors: list[str] = []
     d = agents_dir(config_path)
     try:
@@ -529,7 +535,7 @@ def load_agents(config_path: str,
     for aid, steps in (step_overrides or {}).items():
         if aid in agents:
             agents[aid] = dataclasses.replace(agents[aid], steps=tuple(steps))
-    return list(agents.values()), errors
+    return [a for a in agents.values() if include_hidden or a.id not in HIDDEN_AGENT_IDS], errors
 
 
 def pick_agent(agents: list[DraftAgent], agent_id: str | None) -> DraftAgent:
@@ -646,6 +652,8 @@ async def build_draft_request(agent: DraftAgent, row: Row, note: str, current: s
         lines += ["", "[에이전트 초안]", drafts.strip()]
     if agent.memo:  # 메모를 받지 않는 에이전트(goal)는 절 자체를 넣지 않는다
         lines += ["", "[사용자 메모]", note.strip() or "(없음 — 상황에 맞는 다음 지시를 제안)"]
+    elif agent.id == VERDICT_AGENT_ID and include_context and note.strip():
+        lines += ["", "[최근 전송 기록]", note.strip()]  # judge_progress 가 note 자리로 넘긴 전송 기록
     if current.strip():
         lines += ["", "[기존 초안]", current.strip()]
     return "\n".join(lines)
@@ -697,7 +705,7 @@ def agent_json(agent: DraftAgent) -> str:
 
 
 def draft_system_prompt(agent: DraftAgent) -> str:
-    return DRAFT_SYSTEM + f"\n[역할] (character: {agent.id})\n" + agent.instructions.strip() + "\n"
+    return (VERDICT_SYSTEM if agent.id == VERDICT_AGENT_ID else DRAFT_SYSTEM) + f"\n[역할] (character: {agent.id})\n" + agent.instructions.strip() + "\n"
 
 
 async def draft_prompt(cfg: AIConfig, agent: DraftAgent, row: Row, note: str, current: str,
@@ -816,6 +824,220 @@ async def draft_each(cfg: AIConfig, agents: list[DraftAgent], row: Row, note: st
     return final
 
 
+# ---------------------------------------------------------------------------
+# 진행 판정: 자동 전송 루프가 멈출 조건. 판정 에이전트(verdict)가 달성/계속/막힘을 정하고,
+# is_stalled 가 AI 없이 반복을 감지하며, notify_user 가 사람을 부른다. 루프 자체는 여기 없다.
+# ---------------------------------------------------------------------------
+VERDICT_AGENT_ID = "verdict"
+HIDDEN_AGENT_IDS = frozenset({VERDICT_AGENT_ID})  # 프롬프트 초안을 쓰지 않아 작성 에이전트 목록·설정에서 빼는 id
+
+VERDICT_SYSTEM = """\
+너는 코딩 에이전트(Claude Code, Codex 등)의 작업 진행을 판정하는 심사자다. 프롬프트를 쓰지 않는다.
+아래 '에이전트 상황'(원래 지시, 마지막 응답, 프로젝트 목표, 변경분, 최근 커밋, 최근 전송 기록 중 주어진 것)만 근거로
+이 작업을 끝낼지, 다음 지시를 이어서 보낼지, 사람을 불러야 할지 정한다.
+
+요청에는 [에이전트] JSON 이 함께 온다. "agent.character" 는 네 역할 id 이고 그 역할의 지시문은 아래 [역할]에 있다.
+"agent.think_steps" 는 답을 쓰기 전에 번호 순서대로 거치는 생각 단계다. 그 순서로 생각한 뒤, 생각 과정은
+출력하지 않고 판정만 출력한다.
+
+출력 규칙:
+- 아래 형태의 JSON 객체 하나만 출력한다. 서문, 설명, 코드 펜스, 다른 키는 쓰지 않는다.
+  {"verdict": "done" | "continue" | "stuck", "reason": "<한국어 한 문장>"}
+- done: 원래 지시(와 그것이 기여하는 목표 항목)가 달성되었고 남은 일이 없다.
+- continue: 아직 할 일이 남았고, 다음 지시나 질문에 대한 답을 보내면 더 나아갈 수 있다.
+- stuck: 같은 오류·같은 질문이 되풀이되거나, 전송은 이어지는데 변경분에 진전이 없거나, 사람만 정할 수 있는 결정·권한·
+  외부 자원이 필요하다.
+- reason 에는 판정의 근거를 상황에 있는 사실로 한 문장만 적는다. 추측한 파일·명령은 적지 않는다.
+- 근거가 부족하면 continue 로 하되 무엇이 부족한지 reason 에 적는다.
+"""
+
+VERDICT_AGENT = DraftAgent(
+    id=VERDICT_AGENT_ID, name="진행 판정",
+    description="목표와 최근 진행을 보고 달성·계속·막힘을 판정한다",
+    context=("instruction", "last_message", "goal", "diff", "log"),
+    memo=False, final=False,
+    steps=("원래 지시와 프로젝트 목표에서 이 작업이 끝났다고 볼 조건을 정하고, 변경분과 마지막 응답이 그 조건을 채웠는지 본다",
+           "마지막 응답이 질문인지, 완료 보고인지, 오류·실패 보고인지 가린다",
+           "변경분과 최근 커밋이 그 조건을 향한 진전인지, 최근 전송 기록에 같은 지시가 되풀이되는지 본다",
+           "달성(done)·계속(continue)·막힘(stuck) 중 하나를 고르고 근거를 한 문장으로 적는다"),
+    instructions="""\
+역할: 작업이 끝났는지, 더 시킬 일이 남았는지, 사람이 봐야 하는지를 가르는 심사자.
+- 완료 보고는 그대로 믿지 않고 변경분·최근 커밋이 원래 지시를 실제로 채웠는지 확인한다. 변경분을 볼 수 없으면 마지막 응답으로 판단하고 그 사실을 reason 에 적는다.
+- 마지막 응답이 질문이면, 원래 지시와 목표로 답할 수 있는 질문은 continue, 사람의 선호·권한·비용이 걸린 선택은 stuck 이다.
+- 마지막 응답이 오류 보고면, 처음 나온 오류는 continue, 최근 전송 기록의 지시가 이미 그 오류를 다뤘는데도 되풀이되면 stuck 이다.
+- 목표의 「범위 밖」에 해당하는 작업을 계속 넓히고 있으면 stuck 이다.
+- '최근 전송 기록'의 '(자동)' 표시는 사람 없이 보낸 지시다. 자동 지시가 이어지는데 변경분이 그대로면 stuck 쪽으로 본다.
+""")
+SYSTEM_AGENTS: list[DraftAgent] = [VERDICT_AGENT]
+
+VERDICT_STYLE = {"done": ("달성", "bold green"), "continue": ("계속", "cyan"), "stuck": ("막힘", "bold red")}
+VERDICT_ALIASES = {"달성": "done", "완료": "done", "계속": "continue", "막힘": "stuck"}
+VERDICT_FAILED = "판정 실패"
+STALL_WINDOW = 3     # 정지 감지에 보는 최근 자동 전송 횟수
+STALL_RATIO = 0.8    # 이 이상 닮은 지시는 같은 지시로 본다 (difflib ratio)
+
+
+@dataclass
+class Verdict:
+    verdict: str   # "done" | "continue" | "stuck"
+    reason: str    # 한국어 한 문장. 판정을 못 했으면 "판정 실패: …" 로 시작하고 verdict 는 "continue"
+
+    @property
+    def failed(self) -> bool:
+        return self.reason.startswith(VERDICT_FAILED)
+
+    @property
+    def label(self) -> str:
+        return VERDICT_FAILED if self.failed else VERDICT_STYLE.get(self.verdict, (self.verdict,))[0]
+
+    @property
+    def style(self) -> str:
+        return "dim" if self.failed else VERDICT_STYLE.get(self.verdict, ("", "white"))[1]
+
+
+def load_verdict_agent(config_path: str, step_overrides: dict[str, list[str]] | None = None,
+                       repo_dir: str | None = None) -> DraftAgent:
+    """판정 에이전트 정의. 내장 정의를 <설정 디렉터리>/agents/verdict.md, 그다음 저장소의
+    .orca-dash/agents/verdict.md 가 덮고(잘못된 파일은 무시), 설정의 agent_steps 가 생각의 흐름을 바꾼다.
+    어떻게 정의하든 메모를 받지 않고 최종 결정 에이전트가 아니다."""
+    agent = VERDICT_AGENT
+    paths = [os.path.join(agents_dir(config_path), VERDICT_AGENT_ID + ".md")]
+    if repo_dir:
+        paths.append(os.path.join(repo_dir, ".orca-dash", "agents", VERDICT_AGENT_ID + ".md"))
+    for path in paths:
+        if os.path.isfile(path):
+            try:
+                agent = parse_agent_file(path)
+            except (ConfigError, OSError):
+                pass
+    steps = (step_overrides or {}).get(VERDICT_AGENT_ID)
+    if steps is not None:
+        agent = dataclasses.replace(agent, steps=tuple(steps))
+    return dataclasses.replace(agent, memo=False, final=False)
+
+
+def parse_verdict(text: str) -> Verdict:
+    """모델 출력에서 {"verdict", "reason"} 을 꺼낸다. 코드 펜스나 앞뒤 설명이 붙어 있어도 첫 번째로 해석되는
+    객체를 쓴다. 해석하지 못하면 루프를 막지 않도록 Verdict("continue", "판정 실패: …")."""
+    t = strip_fences(text or "")
+    if not t:
+        return Verdict("continue", f"{VERDICT_FAILED}: 빈 응답")
+    data = None
+    decoder = json.JSONDecoder()
+    start = t.find("{")
+    while start != -1:
+        try:
+            obj, _ = decoder.raw_decode(t[start:])
+        except ValueError:
+            obj = None
+        if isinstance(obj, dict) and "verdict" in obj:
+            data = obj
+            break
+        start = t.find("{", start + 1)
+    if data is None:
+        return Verdict("continue", f"{VERDICT_FAILED}: JSON 해석 실패 — {_first_line(t, 60)}")
+    value = str(data.get("verdict") or "").strip().lower()
+    value = VERDICT_ALIASES.get(value, value)
+    if value not in VERDICT_STYLE:
+        return Verdict("continue", f"{VERDICT_FAILED}: 모르는 판정 값 — {value or '(없음)'}")
+    reason = " ".join(str(data.get("reason") or "").split())
+    if reason.startswith(VERDICT_FAILED):
+        reason = "사유: " + reason   # 모델이 쓴 문장이 실패 표식으로 읽히지 않게
+    return Verdict(value, _clip(reason, 300) or "(사유 없음)")
+
+
+def _auto_sends(history: list[dict] | None) -> list[dict]:
+    """전송 기록에서 자동 전송만 시간순으로."""
+    autos = [h for h in (history or []) if isinstance(h, dict) and h.get("auto")]
+    return sorted(autos, key=lambda h: h.get("at") or 0)
+
+
+def is_stalled(history: list[dict] | None, heads: list[str] | None = None) -> tuple[bool, str]:
+    """AI 없이 자동 전송이 헛도는지 본다. (막혔는지, 한국어 사유)
+
+    - 같은 지시 반복: 최근 자동 전송 3회의 text 가 서로 difflib ratio 0.8 이상.
+    - 변경 없이 반복: 최근 자동 전송 3회 시점의 저장소 HEAD 가 모두 같음. heads 는 그 시점들의 HEAD
+      (오래된 것부터, repo_head 의 값)이고, 주지 않으면 각 기록의 "head" 값을 쓴다. 값이 없으면 이 규칙은 건너뛴다.
+    history 는 그 행의 전송 기록(at · text · auto). 사람이 보낸 것(auto=False)은 세지 않는다.
+    """
+    recent = _auto_sends(history)[-STALL_WINDOW:]
+    if len(recent) == STALL_WINDOW:
+        texts = [str(h.get("text") or "").strip()[:2000] for h in recent]
+        if all(texts) and all(difflib.SequenceMatcher(None, a, b).ratio() >= STALL_RATIO
+                              for i, a in enumerate(texts) for b in texts[i + 1:]):
+            return True, f"같은 지시 반복: 최근 자동 전송 {STALL_WINDOW}회의 내용이 거의 같음"
+    if heads is None:
+        heads = [str(h.get("head") or "") for h in recent]
+    last = [str(h or "").strip() for h in heads][-STALL_WINDOW:]
+    if len(last) == STALL_WINDOW and all(last) and len(set(last)) == 1:
+        return True, f"변경 없이 반복: 최근 자동 전송 {STALL_WINDOW}회 동안 저장소 변경이 없음"
+    return False, ""
+
+
+async def repo_head(repo_dir: str | None) -> str:
+    """is_stalled 의 heads 에 넣을 저장소 상태 값: HEAD 커밋 + (커밋 전 변경이 있으면) 그 내용의 해시.
+    커밋하지 않고 고치기만 해도 값이 달라진다. 저장소가 아니거나 읽지 못하면 빈 문자열."""
+    if not repo_dir or not os.path.isdir(repo_dir):
+        return ""
+    import hashlib
+    head = (await _git(repo_dir, "rev-parse", "HEAD")).strip()
+    dirty = (await _git(repo_dir, "diff", "HEAD")) + (await _git(repo_dir, "status", "--porcelain"))
+    if not head and not dirty.strip():
+        return ""
+    return head[:12] + ("+" + hashlib.sha1(dirty.encode()).hexdigest()[:8] if dirty.strip() else "")
+
+
+def history_text(history: list[dict] | None, limit: int = 8) -> str:
+    """판정 요청의 [최근 전송 기록] 절 본문. 오래된 것부터 한 줄씩, 자동 전송은 '(자동)' 표시."""
+    items = sorted((h for h in (history or []) if isinstance(h, dict)), key=lambda h: h.get("at") or 0)[-limit:]
+    lines = []
+    for h in items:
+        try:
+            at = datetime.fromtimestamp(float(h.get("at") or 0)).strftime("%m-%d %H:%M")
+        except (TypeError, ValueError, OverflowError, OSError):
+            at = "-"
+        text = " ".join(str(h.get("text") or "").split())
+        lines.append(f"- {at} ({'자동' if h.get('auto') else '사람'}) {text[:300]}{'…' if len(text) > 300 else ''}")
+    return "\n".join(lines)
+
+
+async def judge_progress(cfg: AIConfig, row: Row, repo_dir: str | None, history: list[dict] | None, *,
+                         agent: DraftAgent | None = None, cwd: str | None = None) -> Verdict:
+    """이 행의 작업이 달성(done)·계속(continue)·막힘(stuck) 중 어디인지 판정한다. 예외를 내지 않는다.
+
+    먼저 is_stalled(history) 로 반복을 보고, 걸리면 AI 를 부르지 않고 stuck. 아니면 판정 에이전트를 초안과 같은
+    경로(draft_prompt)로 실행해 JSON 을 해석한다. AI 가 꺼져 있거나 실패·빈 응답·깨진 JSON 이면
+    Verdict("continue", "판정 실패: …") — 호출하는 루프는 Verdict.failed 로 구분할 수 있다.
+    history 는 그 행의 최근 전송 기록(at · text · auto), agent 는 load_verdict_agent 의 결과(없으면 내장)."""
+    stalled, why = is_stalled(history)
+    if stalled:
+        return Verdict("stuck", why)
+    if cfg is None or not cfg.enabled:
+        return Verdict("continue", f"{VERDICT_FAILED}: AI 기능이 꺼져 있음")
+    try:
+        text = await draft_prompt(cfg, agent or VERDICT_AGENT, row, history_text(history), "",
+                                  cwd or repo_dir or tempfile.gettempdir(), repo_dir)
+    except Exception as e:  # DraftError 외의 오류도 루프를 죽이지 않는다 (취소는 BaseException 이라 그대로 전파)
+        return Verdict("continue", f"{VERDICT_FAILED}: {_first_line(str(e), 120) or type(e).__name__}")
+    return parse_verdict(text)
+
+
+def notify_user(title: str, text: str) -> None:
+    """macOS 알림 센터로 사람을 부른다. 다른 OS 이거나 실패하면 조용히 넘어간다. 끝나기를 기다리지 않는다."""
+    if sys.platform != "darwin":
+        return
+    try:
+        # 제목·본문은 스크립트에 끼워 넣지 않고 인자로 넘긴다 (따옴표·역슬래시 이스케이프 문제 없음)
+        subprocess.Popen(
+            ["osascript", "-e", "on run argv",
+             "-e", "display notification (item 2 of argv) with title (item 1 of argv)",
+             "-e", "end run", str(title)[:120], str(text)[:400]],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+    except Exception:
+        pass
+
+
 class PromptArea(TextArea):
     """Enter 는 전송, Ctrl+J / Shift+Enter / Alt+Enter 는 줄바꿈.
 
@@ -865,6 +1087,7 @@ class PromptScreen(ModalScreen[str | None]):
     BINDINGS = [
         Binding("escape", "cancel", "취소"),
         Binding("ctrl+g", "draft", "AI 초안", priority=True),
+        Binding("ctrl+t", "judge", "진행 판정", priority=True),
         Binding("ctrl+s", "send", "보내기", show=False, priority=True),  # 터미널이 전달해 주는 경우에만
     ]
 
@@ -886,7 +1109,7 @@ class PromptScreen(ModalScreen[str | None]):
 
     def compose(self) -> ComposeResult:
         r = self.row
-        keys = "Enter 전송 · Ctrl+J 줄바꿈" + (" · Ctrl+G AI 초안" if self.ai else "") + " · Esc 취소"
+        keys = "Enter 전송 · Ctrl+J 줄바꿈" + (" · Ctrl+G AI 초안 · Ctrl+T 진행 판정" if self.ai else "") + " · Esc 취소"
         with Vertical():
             yield Label(f"프롬프트 보내기  ({keys})", id="title")
             yield Label(f"대상: [{r.host}] {r.repo} / {r.worktree} ({r.branch}) · {r.agent_type}"
@@ -934,8 +1157,8 @@ class PromptScreen(ModalScreen[str | None]):
         self.query_one("#agent-order", Label).update(self._order_text())
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        if action == "draft" and not self.ai:
-            return False  # --ai off: Footer 에서도 Ctrl+G 안내를 숨긴다
+        if action in ("draft", "judge") and not self.ai:
+            return False  # --ai off: Footer 에서도 Ctrl+G · Ctrl+T 안내를 숨긴다
         return True
 
     # --- AI 초안 ---------------------------------------------------------
@@ -1036,6 +1259,53 @@ class PromptScreen(ModalScreen[str | None]):
             return True
         return False
 
+    # --- 진행 판정 (Ctrl+T) ----------------------------------------------
+    # 생성자 인자를 늘리지 않도록 앱이 화면을 만든 뒤 아래 속성을 채운다 (OrcaDash._attach_verdict).
+    history: list[dict] | tuple = ()            # 이 행의 최근 전송 기록 (at · text · auto)
+    verdict_agent: DraftAgent | None = None     # None 이면 내장 VERDICT_AGENT
+    on_verdict = None                           # 판정이 나오면 호출 (Verdict) — 앱이 표에 기록
+    verdict_worker: Worker | None = None
+    last_verdict: Verdict | None = None
+
+    @property
+    def judging(self) -> bool:
+        return self.verdict_worker is not None and self.verdict_worker.is_running
+
+    def action_judge(self) -> None:
+        """판정 에이전트에게 달성/계속/막힘을 묻는다. 입력창 내용은 건드리지 않고 상태 줄에만 결과를 적는다."""
+        if not self.ai:
+            self.notify("AI 기능이 꺼져 있어 진행 판정을 할 수 없습니다.", severity="warning")
+            return
+        if self.drafting:
+            self.notify("AI 가 초안을 작성 중입니다. 끝난 뒤 판정하세요.", severity="warning")
+            return
+        name = (self.verdict_agent or VERDICT_AGENT).name
+        self._set_ai_status(f"{name} 중… ({self.ai.provider}, Esc 중단)")
+        self.verdict_worker = self.run_worker(self._judge(), group="verdict", exclusive=True, exit_on_error=False)
+
+    async def _judge(self) -> Verdict:
+        assert self.ai is not None
+        try:
+            verdict = await judge_progress(self.ai, self.row, self.repo_dir, list(self.history),
+                                           agent=self.verdict_agent, cwd=self.cwd)
+        except asyncio.CancelledError:
+            try:
+                self._set_ai_status("진행 판정 중단됨")
+            except Exception:
+                pass  # 창이 닫히는 중
+            raise
+        self.last_verdict = verdict
+        self._set_ai_status(f"진행 판정: {verdict.label} — {verdict.reason}")
+        if self.on_verdict:
+            self.on_verdict(verdict)
+        return verdict
+
+    def _cancel_judge(self) -> bool:
+        if self.judging and self.verdict_worker is not None:
+            self.verdict_worker.cancel()
+            return True
+        return False
+
     # --- 전송/취소 -------------------------------------------------------
     def action_send(self) -> None:
         if self.drafting:
@@ -1048,8 +1318,8 @@ class PromptScreen(ModalScreen[str | None]):
         self.dismiss(text)
 
     def action_cancel(self) -> None:
-        if self._cancel_draft():
-            return  # 생성만 중단, 창은 유지
+        if self._cancel_draft() or self._cancel_judge():
+            return  # 생성·판정만 중단, 창은 유지
         self.dismiss(None)
 
     def on_prompt_area_submit(self, event: PromptArea.Submit) -> None:
@@ -1410,8 +1680,8 @@ class SettingsScreen(ModalScreen[Settings | None]):
         self.overrides = list(overrides)
         self.file_mode = file_mode
         # 에이전트 탭: 생각의 흐름 편집 상태. base 는 설정 덮어쓰기 전(내장·md 파일) 기본값.
-        self.base_agents, _ = load_agents(path)
-        self.agents, _ = load_agents(path, settings.agent_steps)
+        self.base_agents, _ = load_agents(path, include_hidden=True)   # 진행 판정 에이전트의 단계도 여기서 편집
+        self.agents, _ = load_agents(path, settings.agent_steps, include_hidden=True)
         self.steps: dict[str, list[str]] = {a.id: list(a.steps) for a in self.agents}
         self.cur_agent: str = pick_agents(self.agents, settings.ai_agents)[0].id
 
@@ -1461,7 +1731,7 @@ class SettingsScreen(ModalScreen[Settings | None]):
                                                       s.ai_context, id="ai_context"))
                 yield from row("작성 에이전트", Input(" ".join(s.ai_agents), id="ai_agents",
                                                  placeholder="id 를 실행 순서대로, 공백 구분 (예: goal review)"))
-                yield Label("사용 가능: " + " · ".join(f"{a.id}({a.name})" for a in self.agents)
+                yield Label("사용 가능: " + " · ".join(f"{a.id}({a.name})" for a in self.agents if a.id not in HIDDEN_AGENT_IDS)
                             + f"\n추가: {agents_dir(self.path)}/<id>.md (frontmatter name·description·context + 지시문). "
                               "프롬프트 창에서도 체크해 고를 수 있음 · 생각의 흐름은 「에이전트」 탭", classes="hint")
                 yield Label("키보드", classes="section")
@@ -1488,7 +1758,9 @@ class SettingsScreen(ModalScreen[Settings | None]):
         where = "내장" if a.builtin else f"파일 {a.path}"
         return (f"{a.description or '-'}  ·  {where}  ·  컨텍스트: {', '.join(a.context)}"
                 + ("" if a.memo else "  ·  사용자 메모: 받지 않음")
-                + ("  ·  최종 결정: 다른 에이전트들의 초안을 받아 하나로 정함" if a.final else ""))
+                + ("  ·  최종 결정: 다른 에이전트들의 초안을 받아 하나로 정함" if a.final else "")
+                + ("  ·  프롬프트 초안용이 아님: 프롬프트 창 Ctrl+T 와 자동 전송 루프가 호출"
+                   if a.id in HIDDEN_AGENT_IDS else ""))
 
     def _step_rows(self, steps: list[str]) -> list:
         """단계 편집 행 위젯들. compose 와 mount 양쪽에서 쓰므로 컨텍스트 매니저 대신 직접 만든다."""
@@ -1553,7 +1825,7 @@ class SettingsScreen(ModalScreen[Settings | None]):
     def action_save(self) -> None:
         new = self._collect()
         errs = new.validate()
-        known = {a.id for a in self.agents}
+        known = {a.id for a in self.agents if a.id not in HIDDEN_AGENT_IDS}
         unknown = [i for i in new.ai_agents if i not in known]
         if unknown:
             errs.append(f"모르는 작성 에이전트: {', '.join(unknown)}")
@@ -1832,6 +2104,7 @@ class OrcaDash(App):
                 state_txt.append(f" (주:{STATE_STYLE.get(r.main_state, (r.main_state,))[0]})", style="dim")
             if r.wait:
                 state_txt.append(f" · {r.wait}", style="yellow")
+            self._append_verdict(state_txt, r)
             wt = Text(("● " if r.unread else "") + r.worktree)
             table.add_row(state_txt, _ago(r.started_at), r.host, r.repo, wt, r.branch,
                           r.agent_type, r.tool, _clock(r.updated_at), r.summary, key=r.key)
@@ -1870,6 +2143,7 @@ class OrcaDash(App):
         self.query_one("#status", Static).update(
             f"필터: {FILTERS[self.filter_idx]} | 빈 워크트리: {'표시' if self.show_empty else '숨김'} | "
             f"표시 {len(vis)}행 | {summary} | 마지막 조회 {since} (간격 {self.interval}초)"
+            + self._verdict_summary()
         )
 
     def _current_row(self) -> Row | None:
@@ -1899,6 +2173,7 @@ class OrcaDash(App):
         agents, agent_errors = load_agents(self.config_path, self.settings.agent_steps)  # 열 때마다 읽어 새 파일이 바로 보이게
         screen = PromptScreen(row, self.ai, repo_dir or tempfile.gettempdir(), repo_dir=repo_dir,
                               agents=agents, agent_ids=self.settings.ai_agents, agent_errors=agent_errors)
+        self._attach_verdict(screen, row, repo_dir)
 
         def on_result(text: str | None) -> None:
             chosen = [a.id for a in screen.chain]
@@ -1931,7 +2206,62 @@ class OrcaDash(App):
         key = event.row_key.value if event.row_key else None
         row = next((r for r in self.rows if r.key == key), None)
         if row:
-            self.query_one("#detail", Static).update(row.detail)
+            self.query_one("#detail", Static).update(row.detail + self._verdict_detail(row))
+
+    # --- 진행 판정 -----------------------------------------------------------
+    @property
+    def verdicts(self) -> dict[str, tuple[Verdict, float | None]]:
+        """행 key → (마지막 판정, 판정 당시 행의 updated_at). __init__ 을 건드리지 않도록 처음 쓸 때 만든다."""
+        return self.__dict__.setdefault("_verdicts", {})
+
+    def set_verdict(self, row: Row, verdict: Verdict, *, alert: bool = False) -> None:
+        """행의 마지막 판정을 기록하고 표를 다시 그린다. alert 이면 달성·막힘일 때 macOS 알림으로 사람을 부른다
+        (자동 전송 루프용 — 사람이 직접 요청한 판정은 알리지 않는다)."""
+        self.verdicts[row.key] = (verdict, row.updated_at)
+        if alert and not verdict.failed and verdict.verdict in ("done", "stuck"):
+            notify_user(f"orca-dash · {verdict.label}", f"{row.repo}/{row.worktree}: {verdict.reason}")
+        if self.is_mounted:
+            self._render_table()
+            if (cur := self._current_row()) is not None and cur.key == row.key:
+                self.query_one("#detail", Static).update(row.detail + self._verdict_detail(row))
+
+    def _verdict_of(self, row: Row) -> tuple[Verdict, bool] | None:
+        """(판정, 그 뒤로 에이전트가 더 움직였는지). 없으면 None."""
+        hit = self.verdicts.get(row.key)
+        return (hit[0], hit[1] != row.updated_at) if hit else None
+
+    def _append_verdict(self, state_txt: Text, row: Row) -> None:
+        hit = self._verdict_of(row)
+        if hit:
+            verdict, stale = hit
+            state_txt.append(f" · 판정 {verdict.label}" + ("(이전)" if stale else ""),
+                             style="dim" if stale else verdict.style)
+
+    def _verdict_detail(self, row: Row) -> str:
+        hit = self._verdict_of(row)
+        if not hit:
+            return ""
+        verdict, stale = hit
+        return (f"\n\n[b]진행 판정[/] {verdict.label}" + (" (이전 응답 기준)" if stale else "")
+                + f" — {markup_escape(verdict.reason)}")
+
+    def _verdict_summary(self) -> str:
+        keys = {r.key for r in self.rows}
+        counts: dict[str, int] = {}
+        for key, (verdict, _) in self.verdicts.items():
+            if key in keys and not verdict.failed and verdict.verdict != "continue":
+                counts[verdict.label] = counts.get(verdict.label, 0) + 1
+        return " | 판정: " + " · ".join(f"{k} {v}" for k, v in counts.items()) if counts else ""
+
+    def _attach_verdict(self, screen: "PromptScreen", row: Row, repo_dir: str | None) -> None:
+        """프롬프트 창의 Ctrl+T 가 쓸 전송 기록·판정 에이전트·결과 콜백을 채운다."""
+        loader = globals().get("load_send_history")  # 자동 전송 작업이 넣는 전송 기록. 없으면 기록 없이 판정
+        try:
+            screen.history = list(loader(os.path.dirname(self.config_path) or ".", row.key)) if loader else []
+        except Exception:
+            screen.history = []
+        screen.verdict_agent = load_verdict_agent(self.config_path, self.settings.agent_steps, repo_dir)
+        screen.on_verdict = lambda verdict: self.set_verdict(row, verdict)
 
 
 def main() -> None:
