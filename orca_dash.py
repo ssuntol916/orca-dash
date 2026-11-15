@@ -25,11 +25,14 @@ Orca 1.4.230 출력 구조 기준으로 작성.
              「에이전트」 탭에서 작성 에이전트별 '생각의 흐름'(답을 쓰기 전에 거치는 생각 단계)을 +/- 로 편집
              「자동 전송」 탭에서 자동 전송 정책(켬/끔 · 허용 상태·대기 사유 · 연속 상한 · 최소 간격 · 저장소별 켬/끔 ·
              최종 결정 에이전트 필수)을 편집. 기본은 꺼짐이고 --auto-send on|off 로 이번 실행만 바꿀 수 있다
+  a          자동 전송 일시 정지/재개. 설정의 auto_send 가 켜져 있으면 새로고침 때마다 정책이 허용하고
+             준비된 제안이 있는 행 하나에 그 제안을 사람 없이 보낸다 (제안이 없으면 보내지 않음).
+             사람이 보낸 것과 자동으로 보낸 것 모두 <설정 디렉터리>/send-log.jsonl 에 한 줄씩 기록한다
   r 새로고침 · f 필터 · e 빈 워크트리 · q 종료
   macOS 에서는 메인 화면이 앞에 있을 때 입력 소스를 영문(ABC)으로 자동 전환하고, 프롬프트·옵션 창을
   열거나 다른 앱으로 가거나 종료하면 원래 입력 소스로 되돌린다 (옵션에서 끌 수 있음). 메인 화면에서 Caps Lock·
   ⌃Space 로 한글로 바꿔도 1초 안에 다시 영문이 된다. 그래서 한글 상태에서도 단축키가 바로 듣는다. 자동 전환이 꺼져 있거나 안 되는 환경에서는 같은 자리의 두벌식 자모(ㅔ=p · ㅐ=o ·
-  ㄱ=r · ㄹ=f · ㄷ=e · ㅂ=q)로도 동작하되, IME 가 자모를 조합 중 상태로 붙잡으면 Space/Enter 로 확정해야 한다.
+  ㄱ=r · ㄹ=f · ㄷ=e · ㅁ=a · ㅂ=q)로도 동작하되, IME 가 자모를 조합 중 상태로 붙잡으면 Space/Enter 로 확정해야 한다.
 
 설정 파일: ~/.config/orca-dash/config.json (--config 로 변경). 명령줄 인자가 있으면 그 값이 우선.
 
@@ -1727,7 +1730,8 @@ def wait_kind(row) -> str:
 
 
 def _history_newest_first(history) -> list[dict]:
-    items = [h for h in (history or []) if isinstance(h, dict)]
+    """전송 기록을 최근 것부터. 실패한 전송(result 가 ok 가 아님)은 보내진 것이 아니므로 세지 않는다."""
+    items = [h for h in (history or []) if isinstance(h, dict) and h.get("result", "ok") == "ok"]
     def at(h: dict) -> float:
         try:
             return float(h.get("at") or 0)
@@ -1795,7 +1799,60 @@ def auto_send_allowed(settings, row, history, *, now: float | None = None,
         elapsed = max(0.0, (time.time() if now is None else now) - last)
         if elapsed < cooldown:
             return False, f"마지막 전송 후 {int(elapsed)}초 ({cooldown}초 미만)"
-    return True, f"허용 (연속 {streak}/{limit}회)"
+    return True, f"허용 (상태 {row.state} · 대기 사유 {kind} · 연속 {streak}/{limit}회)"   # 전송 기록의 policy 에 그대로 남는다
+
+
+# ---------------------------------------------------------------------------
+# 자동 전송: 정책이 허용하고 준비된 제안이 있는 행에 사람 없이 프롬프트를 보내고, 모든 전송을 기록한다.
+# ---------------------------------------------------------------------------
+SEND_LOG_NAME = "send-log.jsonl"
+PROPOSAL_READY = "ready"   # Proposal.status: 보낼 수 있는 상태
+
+
+def config_dir_of(config_path: str) -> str:
+    return os.path.dirname(config_path) or "."
+
+
+def append_send_record(config_dir: str, record: dict) -> None:
+    """<설정 디렉터리>/send-log.jsonl 에 전송 기록 한 줄(JSON)을 덧붙인다. 쓰기 실패는 OSError."""
+    os.makedirs(config_dir, exist_ok=True)
+    with open(os.path.join(config_dir, SEND_LOG_NAME), "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+
+
+def _read_send_log(config_dir: str) -> list[dict]:
+    """기록 전체를 쓴 순서(오래된 것 먼저)로. 파일이 없으면 빈 목록, 깨진 줄은 건너뛴다."""
+    out: list[dict] = []
+    try:
+        with open(os.path.join(config_dir, SEND_LOG_NAME), encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict):
+                    out.append(rec)
+    except OSError:
+        pass
+    return out
+
+
+def load_send_history(config_dir: str, row_key: str, limit: int = 20) -> list[dict]:
+    """그 행의 최근 전송 기록 limit 개를 오래된 것부터 (마지막 항목이 가장 최근)."""
+    recs = [r for r in _read_send_log(config_dir) if r.get("row_key") == row_key]
+    return recs[-limit:] if limit else recs
+
+
+def _sent_ok(rec: dict) -> bool:
+    return rec.get("result", "ok") == "ok"
+
+
+
+def proposal_ready(proposal: Proposal | None, row: Row) -> bool:
+    """자동 전송에 쓸 수 있는 제안인지: 준비 상태이고, 내용이 있고, 행의 지금 턴(updated_at)에 대해 만든 것."""
+    return bool(proposal is not None and getattr(proposal, "status", "") == PROPOSAL_READY
+                and (getattr(proposal, "text", "") or "").strip()
+                and getattr(proposal, "row_updated_at", None) == row.updated_at)
 
 
 class InputSource:
@@ -2165,7 +2222,8 @@ class SettingsScreen(ModalScreen[Settings | None]):
 
     def _collect(self) -> Settings:
         q = self.query_one
-        return Settings(
+        return dataclasses.replace(  # 화면에 없는 항목(자동 전송 정책 등)은 현재 값을 그대로 둔다
+            self.settings,
             interval=q("#interval", Input).value,
             orca=q("#orca", Input).value,
             local=q("#local", Checkbox).value,
@@ -2237,6 +2295,7 @@ class OrcaDash(App):
     BINDINGS = [  # 한글 입력 상태에서는 같은 자리의 자모(ㅔ ㅐ ㄱ ㄹ ㄷ ㅂ)로도 동작
         key_binding("p", "send_prompt", "프롬프트 보내기"),
         key_binding("o", "settings", "옵션"),
+        key_binding("a", "toggle_auto", "자동 전송 정지"),
         key_binding("r", "refresh", "새로고침"),
         key_binding("f", "cycle_filter", "필터"),
         key_binding("e", "toggle_empty", "빈 워크트리"),
@@ -2267,6 +2326,7 @@ class OrcaDash(App):
         self.proposals = ProposalStore()            # 백그라운드 제안 (행 키별)
         self._proposal_queue: list[str] = []        # 제안을 만들 행 키, 앞에서부터 하나씩
         self._proposal_worker: Worker | None = None
+        self._init_auto_send()
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -2282,7 +2342,7 @@ class OrcaDash(App):
         for label, key in [("상태", "state"), ("상태 지속", "age"), ("호스트", "host"),
                            ("저장소", "repo"), ("워크트리", "wt"), ("브랜치", "branch"),
                            ("에이전트", "agent"), ("도구", "tool"), ("갱신", "upd"),
-                           ("요약", "summary")]:
+                           ("자동 전송", "auto"), ("요약", "summary")]:
             table.add_column(label, key=key)
         self._adopt_stale_source()  # 첫 조회(_tick_status 의 감시 포함)보다 먼저 지난 기록을 이어받는다
         self._sync_input_source()
@@ -2428,6 +2488,7 @@ class OrcaDash(App):
         self.query_one("#errors", Static).update("\n".join(self.errors))
         self._queue_proposals()
         self._render_table()
+        self._auto_send_tick()
 
     def action_cycle_filter(self) -> None:
         self.filter_idx = (self.filter_idx + 1) % len(FILTERS)
@@ -2471,7 +2532,7 @@ class OrcaDash(App):
             self._append_verdict(state_txt, r)
             wt = Text(("● " if r.unread else "") + r.worktree)
             table.add_row(state_txt, _ago(r.started_at), r.host, r.repo, wt, r.branch,
-                          r.agent_type, r.tool, _clock(r.updated_at), r.summary, key=r.key)
+                          r.agent_type, r.tool, _clock(r.updated_at), self._auto_cell(r), r.summary, key=r.key)
         if cur:
             try:
                 table.move_cursor(row=table.get_row_index(cur))
@@ -2506,7 +2567,7 @@ class OrcaDash(App):
         since = f"{int(time.time() - self.last_fetch)}초 전" if self.last_fetch else "-"
         self.query_one("#status", Static).update(
             f"필터: {FILTERS[self.filter_idx]} | 빈 워크트리: {'표시' if self.show_empty else '숨김'} | "
-            f"표시 {len(vis)}행 | {summary} | 마지막 조회 {since} (간격 {self.interval}초)"
+            f"표시 {len(vis)}행 | {summary} | {self._auto_status_text()} | 마지막 조회 {since} (간격 {self.interval}초)"
             + self._verdict_summary()
         )
 
@@ -2549,22 +2610,159 @@ class OrcaDash(App):
                 except OSError:
                     pass
             if text:
-                self.run_worker(self._send_prompt(src, row, text), exclusive=False)
+                used = chosen if screen.last_draft else []   # AI 초안을 거쳤을 때만 작성 에이전트를 기록
+                self.run_worker(self._send_prompt(src, row, text, agent_ids=used), exclusive=False)
 
         self._open_modal(screen, on_result)
 
-    async def _send_prompt(self, src: Source, row: Row, text: str) -> None:
+    async def _send_prompt(self, src: Source, row: Row, text: str, *, auto: bool = False,
+                           policy: str = "사람이 직접 전송", agent_ids: list[str] = (),
+                           drafts: dict | None = None) -> bool:
+        """사람(Enter)과 자동 전송이 함께 쓰는 전송 경로. 성공·실패 모두 send-log.jsonl 에 기록한다."""
         target = f"{row.repo}/{row.worktree}"
-        self.notify(f"{target} 에 전송 중…", timeout=3)
+        kind = "자동 전송" if auto else "프롬프트 전송"
+        self.notify(f"{target} 에 {'자동 ' if auto else ''}전송 중…", timeout=3)
+        result = "ok"
         try:
-            msg = await send_prompt(src, row.pane_key or "", text)
-        except OrcaError as e:
-            self.notify(f"{target}: {e}", title="전송 실패", severity="error", timeout=10)
-            return
-        self.notify(f"{target}: {msg}", title="프롬프트 전송", timeout=6)
-        self.proposals.mark_sent(row)
+            try:
+                msg = await send_prompt(src, row.pane_key or "", text)
+            except OrcaError as e:
+                result = str(e) or "오류"
+            except asyncio.CancelledError:
+                result = "취소됨"
+                raise
+            except Exception as e:  # 기록 없이 사라지는 전송이 없도록
+                result = f"{type(e).__name__}: {e}"
+        finally:
+            self._record_send(row, text, auto=auto, policy=policy, agent_ids=list(agent_ids),
+                              drafts=drafts, result=result)
+        if result != "ok":
+            self.notify(f"{target}: {result}", title=f"{kind} 실패", severity="error", timeout=10)
+            return False
+        self.proposals.mark_sent(row)   # 이 턴의 제안은 썼거나(자동) 사람이 대신 답했다 — 지우지 않고 보냄으로
         self._proposals_changed()
+        self.notify(f"{target}: {msg}", title=kind, timeout=6)
         self.set_timer(2, self.action_refresh)
+        return True
+
+    # --- 자동 전송 -----------------------------------------------------------
+    def _init_auto_send(self) -> None:
+        self.auto_paused = False                       # a 키로 토글. 켜져 있으면 tick 이 아무것도 보내지 않는다
+        if not hasattr(self, "proposals"):
+            self.proposals = ProposalStore()           # 행 key → 준비된 제안
+        self._auto_sending = False                     # 자동 전송이 진행 중이면 다음 tick 은 건너뛴다
+        self._auto_tried: dict[str, float | None] = {}  # 행 key → 자동 전송을 시도한 updated_at (성공·실패 모두)
+        self._auto_reasons: dict[str, str] = {}        # 행 key → 마지막 tick 의 판단 (상세 창에 표시)
+        self._auto_times: dict[str, list[float]] = {}  # 행 key → 성공한 자동 전송 시각들
+        self._log_warned = False
+        for rec in _read_send_log(config_dir_of(self.config_path)):
+            if rec.get("auto") and _sent_ok(rec) and rec.get("row_key"):
+                try:
+                    self._auto_times.setdefault(str(rec["row_key"]), []).append(float(rec.get("at") or 0))
+                except (TypeError, ValueError):
+                    pass
+
+    def _record_send(self, row: Row, text: str, *, auto: bool, policy: str, agent_ids: list[str],
+                     drafts: dict | None, result: str) -> None:
+        now = time.time()
+        rec = {"at": now, "row_key": row.key, "repo": row.repo, "worktree": row.worktree, "branch": row.branch,
+               "state": row.state, "wait": row.wait, "agent_ids": agent_ids, "text": text, "auto": auto,
+               "policy": policy, "result": result, "row_updated_at": row.updated_at}
+        if drafts:
+            rec["drafts"] = drafts
+        if auto and result == "ok":
+            self._auto_times.setdefault(row.key, []).append(now)
+        try:
+            append_send_record(config_dir_of(self.config_path), rec)
+        except OSError as e:
+            if not self._log_warned:   # 기록을 못 쓰면 연속 횟수·대기 시간을 셀 수 없으므로 자동 전송을 멈춘다
+                self._log_warned = True
+                self.auto_paused = True
+                self.notify(f"전송 기록을 쓰지 못해 자동 전송을 일시 정지했습니다: {e}", title="전송 기록",
+                            severity="error", timeout=10)
+
+    def _auto_enabled(self) -> bool:
+        s = self.settings
+        return bool(getattr(s, "auto_send", False) or any((getattr(s, "auto_send_repos", None) or {}).values()))
+
+    def _auto_status_text(self) -> str:
+        day = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        today = sum(1 for ts in self._auto_times.values() for t in ts if t >= day)
+        mode = "일시 정지" if self.auto_paused else "ON" if self._auto_enabled() else "OFF"
+        return f"자동 전송 {mode} · 오늘 {today}회"
+
+    def _auto_cell(self, row: Row) -> str:
+        times = self._auto_times.get(row.key)
+        return f"{len(times)}회 {_clock(max(times) * 1000)}" if times else ""
+
+    def action_toggle_auto(self) -> None:
+        self.auto_paused = not self.auto_paused
+        self._auto_reasons = {}
+        if self.auto_paused:
+            self.notify("자동 전송을 일시 정지했습니다. a 로 재개", title="자동 전송", timeout=4)
+        elif self._auto_enabled():
+            self.notify("자동 전송을 재개했습니다. 다음 새로고침부터 보냅니다.", title="자동 전송", timeout=4)
+        else:
+            self.notify("일시 정지는 풀었지만 자동 전송이 꺼져 있습니다 (설정 파일의 auto_send).",
+                        title="자동 전송", severity="warning", timeout=6)
+        self._tick_status()
+
+    def _auto_send_tick(self) -> Row | None:
+        """새로고침 뒤에 호출. 일시 정지가 아니면, 정책이 허용하고 유효한 제안이 있는 행 하나에 그 제안을 보낸다.
+        제안이 없으면 보내지 않는다(여기서 초안 체인을 돌리지 않는다). 한 번에 한 행만 보내고, 성공이든 실패든
+        그 행의 같은 updated_at 에는 다시 시도하지 않는다. 보내기로 한 행을 돌려준다(없으면 None)."""
+        if self.auto_paused or self._auto_sending:
+            return None
+        store = getattr(self, "proposals", None)
+        if store is None:
+            return None
+        self._auto_reasons = {}
+        final_ids: set[str] | None = None
+        cdir = config_dir_of(self.config_path)
+        open_row = self.screen.row.key if isinstance(self.screen, PromptScreen) else None
+        for row in sorted(self.rows, key=lambda r: r.updated_at or 0):   # 가장 오래 기다린 행부터
+            src = self.source_by_label.get(row.source)
+            if not row.pane_key or src is None or src.file:
+                continue
+            if row.key in self._auto_tried and self._auto_tried[row.key] == row.updated_at:
+                self._auto_reasons[row.key] = "이 턴에는 이미 자동 전송을 시도함"
+                continue
+            prop = store.get(row.key)
+            if not proposal_ready(prop, row):
+                continue
+            if row.key == open_row:
+                self._auto_reasons[row.key] = "프롬프트 창이 열려 있어 보류"
+                continue
+            history = load_send_history(cdir, row.key)
+            if any(h.get("auto") and h.get("row_updated_at") == row.updated_at for h in history):
+                self._auto_tried[row.key] = row.updated_at   # 재시작 전에 이 턴에 이미 시도했다
+                self._auto_reasons[row.key] = "이 턴에는 이미 자동 전송을 시도함"
+                continue
+            ok, reason = auto_send_allowed(self.settings, row, history)
+            agent_ids = list(getattr(prop, "agent_ids", None) or [])
+            if ok and getattr(self.settings, "auto_send_require_final", True):
+                if final_ids is None:
+                    agents, _ = load_agents(self.config_path)
+                    final_ids = {a.id for a in agents if a.final}
+                if not final_ids.intersection(agent_ids):
+                    ok, reason = False, "최종 결정 에이전트를 거치지 않은 제안"
+            if not ok:
+                self._auto_reasons[row.key] = f"보류 — {reason}"
+                continue
+            self._auto_tried[row.key] = row.updated_at
+            self._auto_reasons[row.key] = f"전송 — {reason}"
+            self._auto_sending = True
+            self.run_worker(self._auto_send(src, row, prop, reason, agent_ids), group="auto-send",
+                            exclusive=False, exit_on_error=False)
+            return row
+        return None
+
+    async def _auto_send(self, src: Source, row: Row, prop: Proposal, policy: str, agent_ids: list[str]) -> None:
+        try:
+            await self._send_prompt(src, row, prop.text.strip(), auto=True, policy=policy, agent_ids=agent_ids,
+                                    drafts=getattr(prop, "drafts", None))
+        finally:
+            self._auto_sending = False
 
     # --- 백그라운드 제안 --------------------------------------------------------
     def _repo_dir(self, row: Row) -> str | None:
@@ -2673,7 +2871,9 @@ class OrcaDash(App):
         key = event.row_key.value if event.row_key else None
         row = next((r for r in self.rows if r.key == key), None)
         if row:
-            self.query_one("#detail", Static).update(row.detail + self._proposal_detail(row) + self._verdict_detail(row))
+            why = self._auto_reasons.get(row.key)
+            self.query_one("#detail", Static).update(row.detail + self._proposal_detail(row) + self._verdict_detail(row)
+                                                     + (f"\n\n[b]자동 전송[/] {escape(why)}" if why else ""))
 
     # --- 진행 판정 -----------------------------------------------------------
     @property

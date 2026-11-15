@@ -40,7 +40,7 @@ print("ok: defaults")
 
 # 2) 거부 사유 하나씩
 row = mkrow()
-assert check(on(), row) == (True, "허용 (연속 0/3회)")
+assert check(on(), row) == (True, "허용 (상태 waiting_input · 대기 사유 질문 · 연속 0/3회)")
 assert check(od.Settings(), row) == (False, "자동 전송 꺼짐")
 assert check(on(auto_send_repos={"repo1": False}), row) == (False, "저장소 repo1 는 꺼짐")
 assert check(on(auto_send_repos={"other": False}), row)[0]                       # 다른 저장소 설정은 무관
@@ -80,7 +80,7 @@ three = [sent(900), sent(600), sent(300)]
 assert od.auto_send_streak(three) == 3 and od.auto_send_streak(three[::-1]) == 3
 assert check(on(), row, three) == (False, "연속 3회 상한")
 assert check(on(), row, three[::-1]) == (False, "연속 3회 상한")
-assert check(on(auto_send_max_streak=4), row, three) == (True, "허용 (연속 3/4회)")
+assert check(on(auto_send_max_streak=4), row, three) == (True, "허용 (상태 waiting_input · 대기 사유 질문 · 연속 3/4회)")
 broken = [sent(900), sent(600), sent(450, auto=False), sent(300)]
 assert od.auto_send_streak(broken) == 1 and check(on(), row, broken)[0]
 assert od.auto_send_streak([]) == 0 and od.auto_send_streak([sent(10, auto=False), sent(20)]) == 0
